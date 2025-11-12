@@ -1,0 +1,3805 @@
+import asyncio
+import sqlite3
+import math
+from typing import List, Tuple, Optional, Dict
+from datetime import datetime
+import logging
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import WebAppInfo
+
+# Конфигурация
+API_TOKEN = ""
+ADMIN_IDS = []  # ID администраторов
+
+# Инициализация бота и диспетчера
+bot = Bot(token=API_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+class SimpleCalculationState(StatesGroup):
+    entering_length = State()
+    entering_width = State() 
+    entering_height = State()
+    showing_result = State()
+
+# Состояния FSM
+class AdminState(StatesGroup):
+    adding_product_name = State()
+    adding_product_price = State()
+    adding_product_quantity = State()
+    adding_product_category = State()
+    adding_product_unit = State()
+    adding_product_description = State()
+    editing_product_name = State()
+    editing_product_price = State()
+    editing_product_quantity = State()
+    editing_product_category = State()
+    editing_product_unit = State()
+    editing_product_description = State()
+    adding_staff = State()
+    removing_staff = State()
+
+class CalculationState(StatesGroup):
+    # Выбор материала
+    choosing_material = State()
+    entering_dimensions = State()
+    # Размеры материала - кирпич
+    entering_brick_length = State()
+    entering_brick_width = State()
+    entering_brick_height = State()
+    entering_brick_weight = State()
+    entering_brick_pulsatility = State()
+    
+    # Размеры материала - блоки
+    entering_block_length = State()
+    entering_block_width = State()
+    entering_block_height = State()
+    entering_block_density = State()
+    entering_block_weight = State()
+
+    # Параметры строения
+    entering_perimeter = State()
+    entering_wall_height = State()
+    choosing_wall_thickness = State()
+    choosing_mortar_thickness = State()
+    
+    # Фронтоны
+    asking_gables = State()
+    entering_gables_count = State()
+    entering_gable_width = State()
+    entering_gable_height = State()
+    
+    # Окна и двери
+    asking_openings = State()
+    entering_windows_count = State()
+    entering_window_width = State()
+    entering_window_height = State()
+    asking_more_windows = State()
+    entering_doors_count = State()
+    entering_door_width = State()
+    entering_door_height = State()
+    asking_more_doors = State()
+    
+    # Дополнительные параметры
+    asking_mesh = State()
+    choosing_mesh_frequency = State()
+    asking_price = State()
+    entering_price = State()
+    
+    # Подтверждение расчета
+    confirming_calculation = State()
+
+# Инициализация базы данных
+def init_db():
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    
+    # Таблица продуктов
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        price REAL NOT NULL,
+        quantity INTEGER NOT NULL,
+        category TEXT NOT NULL,
+        unit TEXT DEFAULT 'шт.',
+        description TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # Таблица сотрудников
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS staff (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL UNIQUE,
+        username TEXT,
+        full_name TEXT,
+        added_by INTEGER,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # Таблица аудита (логирование действий)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        username TEXT,
+        action TEXT NOT NULL,
+        details TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # Начальные данные
+    cursor.execute("SELECT COUNT(*) FROM products")
+    if cursor.fetchone()[0] == 0:
+        sample_products = [
+            ('Керамзит фракция 10-20 мм', 1500, 100, 'керамзит', 'м³', 'Высококачественный керамзит для утепления и дренажа'),
+            ('Кирпич красный полнотелый М150', 25, 5000, 'кирпич', 'шт.', 'Прочный строительный кирпич для несущих стен'),
+            ('Кирпич облицовочный жёлтый', 35, 3000, 'кирпич', 'шт.', 'Декоративный кирпич для фасадных работ'),
+            ('Газобетонный блок D500 600x300x200', 4500, 200, 'блоки', 'м³', 'Теплый и легкий газобетонный блок'),
+            ('Пеноблок 600x300x200 мм', 4200, 150, 'блоки', 'м³', 'Пенобетонный блок для перегородок'),
+            ('Перфоратор Bosch GBH 2-26 DRE', 12000, 15, 'инструменты', 'шт.', 'Профессиональный перфоратор с SDS-plus'),
+            ('Песок карьерный мытый', 800, 1000, 'песок', 'м³', 'Очищенный карьерный песок для строительных работ'),
+            ('Цемент М500 Д0 50кг', 450, 200, 'цемент', 'мешок', 'Высокомарочный цемент без добавок'),
+            ('ОПГС С-6', 1200, 800, 'опгс', 'м³', 'Обогащенная песчано-гравийная смесь')
+        ]
+        cursor.executemany(
+            "INSERT INTO products (name, price, quantity, category, unit, description) VALUES (?, ?, ?, ?, ?, ?)",
+            sample_products
+        )
+    
+    conn.commit()
+    conn.close()
+
+# Функции для работы с базой данных
+def log_audit(user_id: int, username: str, action: str, details: str = None):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO audit_log (user_id, username, action, details) VALUES (?, ?, ?, ?)",
+        (user_id, username, action, details)
+    )
+    conn.commit()
+    conn.close()
+
+def get_audit_log(limit: int = 20):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?",
+        (limit,)
+    )
+    log = cursor.fetchall()
+    conn.close()
+    return log
+
+def get_products_by_category(category: str = None, page: int = 1, per_page: int = 5):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    
+    if category:
+        cursor.execute(
+            "SELECT COUNT(*) FROM products WHERE category = ?",
+            (category,)
+        )
+        total = cursor.fetchone()[0]
+        
+        cursor.execute(
+            "SELECT * FROM products WHERE category = ? ORDER BY name LIMIT ? OFFSET ?",
+            (category, per_page, (page - 1) * per_page)
+        )
+    else:
+        cursor.execute("SELECT COUNT(*) FROM products")
+        total = cursor.fetchone()[0]
+        
+        cursor.execute(
+            "SELECT * FROM products ORDER BY category, name LIMIT ? OFFSET ?",
+            (per_page, (page - 1) * per_page)
+        )
+    
+    products = cursor.fetchall()
+    conn.close()
+    
+    return products, total
+
+def get_product_categories():
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT category FROM products ORDER BY category")
+    categories = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return categories
+
+def get_all_products():
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM products ORDER BY category, name")
+    products = cursor.fetchall()
+    conn.close()
+    return products
+
+def get_product_by_id(product_id: int):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM products WHERE id = ?", (product_id,))
+    product = cursor.fetchone()
+    conn.close()
+    return product
+
+def add_product(name: str, price: float, quantity: int, category: str, unit: str, description: str = ""):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO products (name, price, quantity, category, unit, description) VALUES (?, ?, ?, ?, ?, ?)",
+        (name, price, quantity, category, unit, description)
+    )
+    conn.commit()
+    conn.close()
+
+def update_product_name(product_id: int, name: str):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE products SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (name, product_id)
+    )
+    conn.commit()
+    conn.close()
+
+def update_product_price(product_id: int, price: float):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE products SET price = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (price, product_id)
+    )
+    conn.commit()
+    conn.close()
+
+def update_product_quantity(product_id: int, quantity: int):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE products SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (quantity, product_id)
+    )
+    conn.commit()
+    conn.close()
+
+def update_product_category(product_id: int, category: str):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE products SET category = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (category, product_id)
+    )
+    conn.commit()
+    conn.close()
+
+def update_product_unit(product_id: int, unit: str):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE products SET unit = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (unit, product_id)
+    )
+    conn.commit()
+    conn.close()
+
+def update_product_description(product_id: int, description: str):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE products SET description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (description, product_id)
+    )
+    conn.commit()
+    conn.close()
+
+def delete_product(product_id: int):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
+    conn.commit()
+    conn.close()
+
+def is_admin(user_id: int):
+    return user_id in ADMIN_IDS
+
+def is_staff(user_id: int):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM staff WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone() is not None
+    conn.close()
+    return result or is_admin(user_id)
+
+def add_staff(user_id: int, username: str = None, full_name: str = None, added_by: int = None):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO staff (user_id, username, full_name, added_by) VALUES (?, ?, ?, ?)",
+            (user_id, username, full_name, added_by)
+        )
+        conn.commit()
+        success = True
+    except sqlite3.IntegrityError:
+        success = False
+    conn.close()
+    return success
+
+def get_all_staff():
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM staff ORDER BY added_at DESC")
+    staff = cursor.fetchall()
+    conn.close()
+    return staff
+
+def remove_staff(user_id: int):
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM staff WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_detailed_stats():
+    conn = sqlite3.connect('stroygrad.db')
+    cursor = conn.cursor()
+    
+    # Общая статистика
+    cursor.execute("SELECT COUNT(*) FROM products")
+    total_products = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM staff")
+    total_staff = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM audit_log")
+    total_actions = cursor.fetchone()[0]
+    
+    # Статистика по категориям
+    cursor.execute("""
+        SELECT category, COUNT(*) as count, SUM(quantity) as total_quantity, 
+               SUM(price * quantity) as total_value 
+        FROM products 
+        GROUP BY category 
+        ORDER BY total_value DESC
+    """)
+    category_stats = cursor.fetchall()
+    
+    # Статистика по активности
+    cursor.execute("""
+        SELECT action, COUNT(*) as count 
+        FROM audit_log 
+        GROUP BY action 
+        ORDER BY count DESC
+    """)
+    activity_stats = cursor.fetchall()
+    
+    # Последние действия
+    cursor.execute("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 5")
+    recent_actions = cursor.fetchall()
+    
+    conn.close()
+    
+    return {
+        'total_products': total_products,
+        'total_staff': total_staff,
+        'total_actions': total_actions,
+        'category_stats': category_stats,
+        'activity_stats': activity_stats,
+        'recent_actions': recent_actions
+    }
+
+# Функции для расчетов
+def calculate_bricks_advanced(params: dict) -> dict:
+    """Расчет кирпича по формуле stroy-calc.ru"""
+    try:
+        # Проверка обязательных параметров
+        required = ['brick_length', 'brick_width', 'brick_height', 'perimeter', 'wall_height', 'wall_thickness', 'mortar_thickness']
+        for param in required:
+            if param not in params:
+                return {"error": f"Отсутствует параметр: {param}"}
+        
+        # Размеры кирпича в метрах
+        brick_length = params['brick_length'] / 1000.0
+        brick_width = params['brick_width'] / 1000.0
+        brick_height = params['brick_height'] / 1000.0
+        
+        # Параметры строения
+        perimeter = params['perimeter']
+        wall_height = params['wall_height'] / 100.0  # см в метры
+        mortar_thickness = params['mortar_thickness'] / 1000.0  # мм в метры
+        
+        # Размеры кирпича с раствором
+        brick_with_mortar_length = brick_length + mortar_thickness
+        brick_with_mortar_height = brick_height + mortar_thickness
+        
+        # Расчет толщины стены
+        wall_thickness = params['wall_thickness']
+        if wall_thickness == 0.5:  # половина кирпича
+            actual_wall_thickness = brick_width
+        elif wall_thickness == 1.0:  # целый кирпич
+            actual_wall_thickness = brick_length
+        elif wall_thickness == 1.5:  # полтора кирпича
+            actual_wall_thickness = brick_width + brick_length
+        elif wall_thickness == 2.0:  # два кирпича
+            actual_wall_thickness = 2 * brick_length
+        else:
+            actual_wall_thickness = brick_length
+        
+        # Площадь стен
+        wall_area = perimeter * wall_height
+        
+        # Вычитаем проемы если есть
+        openings_area = 0
+        if 'openings' in params and params['openings']:
+            for opening in params['openings']:
+                opening_area = (opening['width'] / 100.0) * (opening['height'] / 100.0) * opening['count']
+                openings_area += opening_area
+        
+        # Общая площадь кладки
+        total_area = wall_area - openings_area
+        
+        if total_area <= 0:
+            return {"error": "Общая площадь кладки должна быть положительной"}
+        
+        # Количество кирпичей в квадратном метре
+        bricks_per_square_meter = 1 / (brick_with_mortar_length * brick_with_mortar_height)
+        
+        # Общее количество кирпичей
+        bricks_needed = total_area * bricks_per_square_meter
+        
+        # Объем кладки
+        wall_volume = total_area * actual_wall_thickness
+        
+        # Количество кирпичей в кубе
+        brick_volume = brick_length * brick_width * brick_height
+        bricks_per_cube = 1.0 / brick_volume
+        
+        # Общий объем кирпича
+        total_brick_volume = bricks_needed * brick_volume
+        
+        # Количество рядов
+        rows_count = wall_height / brick_with_mortar_height
+        
+        # Объем раствора (25% от объема кладки)
+        mortar_volume = wall_volume * 0.25
+        
+        # Кладочная сетка
+        mesh_length = 0
+        if 'mesh_frequency' in params and params['mesh_frequency'] > 0:
+            mesh_rows = rows_count / params['mesh_frequency']
+            mesh_length = mesh_rows * perimeter
+        
+        # Вес кирпичей
+        brick_weight = params.get('brick_weight', 3.5)  # кг
+        if 'brick_pulsatility' in params and params['brick_pulsatility'] > 0:
+            # Учет пустотности
+            solid_fraction = 1 - (params['brick_pulsatility'] / 100.0)
+            brick_weight *= solid_fraction
+        
+        total_weight = bricks_needed * brick_weight
+        
+        # Вес раствора (плотность 1900 кг/м³)
+        mortar_weight = mortar_volume * 1900
+        
+        # Нагрузка на фундамент
+        foundation_area = perimeter * 100 * actual_wall_thickness * 100  # см²
+        foundation_load = (total_weight + mortar_weight) / foundation_area if foundation_area > 0 else 0
+        
+        # Стоимость
+        total_cost = bricks_needed * params.get('price', 0)
+        
+        # Оптимальная высота стены
+        optimal_height = math.floor(wall_height / brick_with_mortar_height) * brick_with_mortar_height * 100
+        
+        return {
+            'material_type': 'кирпич',
+            'brick_dimensions': f"{params['brick_length']}×{params['brick_width']}×{params['brick_height']} мм",
+            'perimeter': perimeter,
+            'wall_area': round(total_area, 2),
+            'wall_thickness': round(actual_wall_thickness * 1000),
+            'bricks_needed': round(bricks_needed),
+            'brick_weight': round(brick_weight, 2),
+            'total_weight': round(total_weight),
+            'total_volume': round(total_brick_volume, 2),
+            'bricks_per_cube': round(bricks_per_cube),
+            'mortar_volume': round(mortar_volume, 3),
+            'mortar_weight': round(mortar_weight),
+            'rows_count': round(rows_count),
+            'mesh_length': round(mesh_length, 1),
+            'optimal_height': round(optimal_height),
+            'foundation_load': round(foundation_load, 2),
+            'total_cost': round(total_cost, 2),
+            'total_wall_weight': round(total_weight + mortar_weight)
+        }
+        
+    except Exception as e:
+        return {"error": f"Ошибка расчета кирпича: {str(e)}"}
+
+def calculate_wall_blocks_advanced(params: dict) -> dict:
+    """Расчет стеновых блоков по формуле stroy-calc.ru"""
+    try:
+        required = ['block_length', 'block_width', 'block_height', 'perimeter', 'wall_height', 'wall_thickness', 'mortar_thickness']
+        for param in required:
+            if param not in params:
+                return {"error": f"Отсутствует параметр: {param}"}
+        
+        # Размеры блока в метрах
+        block_length = params['block_length'] / 1000.0
+        block_width = params['block_width'] / 1000.0
+        block_height = params['block_height'] / 1000.0
+        
+        # Параметры строения
+        perimeter = params['perimeter']
+        wall_height = params['wall_height'] / 100.0
+        mortar_thickness = params['mortar_thickness'] / 1000.0
+        
+        # Размеры блока с раствором
+        block_with_mortar_length = block_length + mortar_thickness
+        block_with_mortar_height = block_height + mortar_thickness
+        
+        # Расчет толщины стены
+        wall_thickness = params['wall_thickness']
+        if wall_thickness == 0.5:  # половина блока
+            actual_wall_thickness = block_width
+        elif wall_thickness == 1.0:  # целый блок
+            actual_wall_thickness = block_length
+        elif wall_thickness == 1.5:  # полтора блока
+            actual_wall_thickness = block_width + block_length
+        elif wall_thickness == 2.0:  # два блока
+            actual_wall_thickness = 2 * block_length
+        else:
+            actual_wall_thickness = block_length
+        
+        # Площадь стен
+        wall_area = perimeter * wall_height
+        
+        # Вычитаем проемы
+        openings_area = 0
+        if 'openings' in params and params['openings']:
+            for opening in params['openings']:
+                opening_area = (opening['width'] / 100.0) * (opening['height'] / 100.0) * opening['count']
+                openings_area += opening_area
+        
+        total_area = wall_area - openings_area
+        
+        if total_area <= 0:
+            return {"error": "Общая площадь кладки должна быть положительной"}
+        
+        # Количество блоков в квадратном метре
+        blocks_per_square_meter = 1 / (block_with_mortar_length * block_with_mortar_height)
+        
+        # Общее количество блоков
+        blocks_needed = total_area * blocks_per_square_meter
+        
+        # Объем кладки
+        wall_volume = total_area * actual_wall_thickness
+        
+        # Количество блоков в кубе
+        block_volume = block_length * block_width * block_height
+        blocks_per_cube = 1.0 / block_volume
+        
+        # Общий объем блоков
+        total_volume = blocks_needed * block_volume
+        
+        # Количество рядов
+        rows_count = wall_height / block_with_mortar_height
+        
+        # Объем раствора (20% от объема кладки)
+        mortar_volume = wall_volume * 0.20
+        
+        # Кладочная сетка
+        mesh_length = 0
+        if 'mesh_frequency' in params and params['mesh_frequency'] > 0:
+            mesh_rows = rows_count / params['mesh_frequency']
+            mesh_length = mesh_rows * perimeter
+        
+        # Вес блоков
+        block_weight = params.get('block_weight', 16.0)  # кг
+        total_weight = blocks_needed * block_weight
+        
+        # Вес раствора
+        mortar_weight = mortar_volume * 1900
+        
+        # Нагрузка на фундамент
+        foundation_area = perimeter * 100 * actual_wall_thickness * 100
+        foundation_load = (total_weight + mortar_weight) / foundation_area if foundation_area > 0 else 0
+        
+        # Стоимость
+        total_cost = blocks_needed * params.get('price', 0)
+        
+        # Оптимальная высота
+        optimal_height = math.floor(wall_height / block_with_mortar_height) * block_with_mortar_height * 100
+        
+        return {
+            'material_type': 'стеновые блоки',
+            'block_dimensions': f"{params['block_length']}×{params['block_width']}×{params['block_height']} мм",
+            'perimeter': perimeter,
+            'wall_area': round(total_area, 2),
+            'wall_thickness': round(actual_wall_thickness * 1000),
+            'blocks_needed': round(blocks_needed),
+            'block_weight': round(block_weight, 2),
+            'total_weight': round(total_weight),
+            'total_volume': round(total_volume, 2),
+            'blocks_per_cube': round(blocks_per_cube),
+            'mortar_volume': round(mortar_volume, 3),
+            'mortar_weight': round(mortar_weight),
+            'rows_count': round(rows_count),
+            'mesh_length': round(mesh_length, 1),
+            'optimal_height': round(optimal_height),
+            'foundation_load': round(foundation_load, 2),
+            'total_cost': round(total_cost, 2),
+            'total_wall_weight': round(total_weight + mortar_weight)
+        }
+        
+    except Exception as e:
+        return {"error": f"Ошибка расчета стеновых блоков: {str(e)}"}
+
+def calculate_foam_blocks_advanced(params: dict) -> dict:
+    """Расчет пеноблоков по формуле stroy-calc.ru"""
+    try:
+        required = ['block_length', 'block_width', 'block_height', 'density', 'perimeter', 'wall_height', 'wall_thickness', 'mortar_thickness']
+        for param in required:
+            if param not in params:
+                return {"error": f"Отсутствует параметр: {param}"}
+        
+        # Размеры блока в метрах
+        block_length = params['block_length'] / 1000.0
+        block_width = params['block_width'] / 1000.0
+        block_height = params['block_height'] / 1000.0
+        
+        # Параметры строения
+        perimeter = params['perimeter']
+        wall_height = params['wall_height'] / 100.0
+        density = params['density']
+        mortar_thickness = params['mortar_thickness'] / 1000.0
+        
+        # Размеры с раствором
+        block_with_mortar_length = block_length + mortar_thickness
+        block_with_mortar_height = block_height + mortar_thickness
+        
+        # Толщина стены
+        wall_thickness = params['wall_thickness']
+        if wall_thickness == 0.5:
+            actual_wall_thickness = block_width
+        elif wall_thickness == 1.0:
+            actual_wall_thickness = block_length
+        elif wall_thickness == 1.5:
+            actual_wall_thickness = block_width + block_length
+        elif wall_thickness == 2.0:
+            actual_wall_thickness = 2 * block_length
+        else:
+            actual_wall_thickness = block_length
+        
+        # Площадь стен
+        wall_area = perimeter * wall_height
+        
+        # Проемы
+        openings_area = 0
+        if 'openings' in params and params['openings']:
+            for opening in params['openings']:
+                opening_area = (opening['width'] / 100.0) * (opening['height'] / 100.0) * opening['count']
+                openings_area += opening_area
+        
+        total_area = wall_area - openings_area
+        
+        if total_area <= 0:
+            return {"error": "Общая площадь кладки должна быть положительной"}
+        
+        # Количество блоков в м²
+        blocks_per_square_meter = 1 / (block_with_mortar_length * block_with_mortar_height)
+        blocks_needed = total_area * blocks_per_square_meter
+        
+        # Объемные расчеты
+        block_volume = block_length * block_width * block_height
+        blocks_per_cube = 1.0 / block_volume
+        total_volume = blocks_needed * block_volume
+        
+        # Объем кладки и раствора
+        wall_volume = total_area * actual_wall_thickness
+        mortar_volume = wall_volume * 0.15  # 15% для пеноблоков
+        
+        # Ряды и сетка
+        rows_count = wall_height / block_with_mortar_height
+        mesh_length = 0
+        if 'mesh_frequency' in params and params['mesh_frequency'] > 0:
+            mesh_rows = rows_count / params['mesh_frequency']
+            mesh_length = mesh_rows * perimeter
+        
+        # Вес
+        block_weight = block_volume * density
+        total_weight = blocks_needed * block_weight
+        mortar_weight = mortar_volume * 1900
+        
+        # Нагрузка
+        foundation_area = perimeter * 100 * actual_wall_thickness * 100
+        foundation_load = (total_weight + mortar_weight) / foundation_area if foundation_area > 0 else 0
+        
+        # Стоимость
+        total_cost = total_volume * params.get('price_per_cube', 0)
+        
+        # Оптимальная высота
+        optimal_height = math.floor(wall_height / block_with_mortar_height) * block_with_mortar_height * 100
+        
+        return {
+            'material_type': 'пеноблоки',
+            'block_dimensions': f"{params['block_length']}×{params['block_width']}×{params['block_height']} мм",
+            'density': f"D{density}",
+            'perimeter': perimeter,
+            'wall_area': round(total_area, 2),
+            'wall_thickness': round(actual_wall_thickness * 1000),
+            'blocks_needed': round(blocks_needed),
+            'block_weight': round(block_weight, 2),
+            'total_weight': round(total_weight),
+            'total_volume': round(total_volume, 2),
+            'blocks_per_cube': round(blocks_per_cube),
+            'mortar_volume': round(mortar_volume, 3),
+            'mortar_weight': round(mortar_weight),
+            'rows_count': round(rows_count),
+            'mesh_length': round(mesh_length, 1),
+            'optimal_height': round(optimal_height),
+            'foundation_load': round(foundation_load, 2),
+            'total_cost': round(total_cost, 2),
+            'total_wall_weight': round(total_weight + mortar_weight)
+        }
+        
+    except Exception as e:
+        return {"error": f"Ошибка расчета пеноблоков: {str(e)}"}
+
+def calculate_gas_blocks_advanced(params: dict) -> dict:
+    """Расчет газобетонных блоков (аналогично пеноблокам)"""
+    return calculate_foam_blocks_advanced(params)
+
+def calculate_ceramic_blocks_advanced(params: dict) -> dict:
+    """Расчет керамических блоков по формуле stroy-calc.ru"""
+    try:
+        required = ['block_length', 'block_width', 'block_height', 'perimeter', 'wall_height', 'wall_thickness', 'mortar_thickness']
+        for param in required:
+            if param not in params:
+                return {"error": f"Отсутствует параметр: {param}"}
+        
+        # Размеры блока в метрах
+        block_length = params['block_length'] / 1000.0
+        block_width = params['block_width'] / 1000.0
+        block_height = params['block_height'] / 1000.0
+        
+        # Параметры строения
+        perimeter = params['perimeter']
+        wall_height = params['wall_height'] / 100.0
+        mortar_thickness = params['mortar_thickness'] / 1000.0
+        
+        # Особенность керамических блоков - паз-гребень
+        block_with_mortar_length = block_length + mortar_thickness
+        block_with_mortar_height = block_height + mortar_thickness
+        
+        # Толщина стены (для керамики обычно в блоках)
+        wall_thickness = params['wall_thickness']
+        if wall_thickness == 0.5:
+            actual_wall_thickness = block_width
+        elif wall_thickness == 1.0:
+            actual_wall_thickness = block_width  # Особенность керамики
+        elif wall_thickness == 1.5:
+            actual_wall_thickness = 1.5 * block_width
+        elif wall_thickness == 2.0:
+            actual_wall_thickness = 2 * block_width
+        else:
+            actual_wall_thickness = block_width
+        
+        # Площадь стен
+        wall_area = perimeter * wall_height
+        
+        # Проемы
+        openings_area = 0
+        if 'openings' in params and params['openings']:
+            for opening in params['openings']:
+                opening_area = (opening['width'] / 100.0) * (opening['height'] / 100.0) * opening['count']
+                openings_area += opening_area
+        
+        total_area = wall_area - openings_area
+        
+        if total_area <= 0:
+            return {"error": "Общая площадь кладки должна быть положительной"}
+        
+        # Количество блоков
+        blocks_per_square_meter = 1 / (block_with_mortar_length * block_with_mortar_height)
+        blocks_needed = total_area * blocks_per_square_meter
+        
+        # Объемные расчеты
+        block_volume = block_length * block_width * block_height
+        blocks_per_cube = 1.0 / block_volume
+        total_volume = blocks_needed * block_volume
+        
+        # Объем раствора (меньше для керамики - 5%)
+        wall_volume = total_area * actual_wall_thickness
+        mortar_volume = wall_volume * 0.05
+        
+        # Ряды и сетка
+        rows_count = wall_height / block_with_mortar_height
+        mesh_length = 0
+        if 'mesh_frequency' in params and params['mesh_frequency'] > 0:
+            mesh_rows = rows_count / params['mesh_frequency']
+            mesh_length = mesh_rows * perimeter
+        
+        # Вес (керамика плотнее)
+        block_weight = params.get('block_weight', block_volume * 800)  # ~800 кг/м³
+        total_weight = blocks_needed * block_weight
+        mortar_weight = mortar_volume * 1900
+        
+        # Нагрузка
+        foundation_area = perimeter * 100 * actual_wall_thickness * 100
+        foundation_load = (total_weight + mortar_weight) / foundation_area if foundation_area > 0 else 0
+        
+        # Стоимость
+        total_cost = blocks_needed * params.get('price', 0)
+        
+        # Оптимальная высота
+        optimal_height = math.floor(wall_height / block_with_mortar_height) * block_with_mortar_height * 100
+        
+        return {
+            'material_type': 'керамические блоки',
+            'block_dimensions': f"{params['block_length']}×{params['block_width']}×{params['block_height']} мм",
+            'perimeter': perimeter,
+            'wall_area': round(total_area, 2),
+            'wall_thickness': round(actual_wall_thickness * 1000),
+            'blocks_needed': round(blocks_needed),
+            'block_weight': round(block_weight, 2),
+            'total_weight': round(total_weight),
+            'total_volume': round(total_volume, 2),
+            'blocks_per_cube': round(blocks_per_cube),
+            'mortar_volume': round(mortar_volume, 3),
+            'mortar_weight': round(mortar_weight),
+            'rows_count': round(rows_count),
+            'mesh_length': round(mesh_length, 1),
+            'optimal_height': round(optimal_height),
+            'foundation_load': round(foundation_load, 2),
+            'total_cost': round(total_cost, 2),
+            'total_wall_weight': round(total_weight + mortar_weight)
+        }
+        
+    except Exception as e:
+        return {"error": f"Ошибка расчета керамических блоков: {str(e)}"}
+
+def perform_simple_calculation(material_type: str, length: float, width: float, height: float) -> dict:
+    """Простой расчет количества материала по стандартным размерам"""
+    
+    # Объем конструкции
+    volume = length * width * height
+    
+    # Стандартные размеры материалов (в метрах)
+    standard_sizes = {
+        "bricks": {
+            "length": 0.25, "width": 0.12, "height": 0.065,
+            "name": "Кирпич одинарный", "per_cube": 394
+        },
+        "gas_blocks": {
+            "length": 0.625, "width": 0.25, "height": 0.25, 
+            "name": "Газобетонный блок", "per_cube": 26
+        },
+        "foam_blocks": {
+            "length": 0.6, "width": 0.3, "height": 0.2,
+            "name": "Пеноблок", "per_cube": 28
+        },
+        "ceramic_blocks": {
+            "length": 0.51, "width": 0.25, "height": 0.219,
+            "name": "Керамический блок", "per_cube": 36
+        }
+    }
+    
+    material_info = standard_sizes.get(material_type, standard_sizes["bricks"])
+    
+    # Расчет количества
+    material_volume = material_info["length"] * material_info["width"] * material_info["height"]
+    quantity = int(volume / material_volume)
+    
+    # Дополнительные расчеты
+    per_cube = material_info["per_cube"]
+    cubes_needed = volume
+    
+    return {
+        "material_name": material_info["name"],
+        "material_size": f"{int(material_info['length']*1000)}×{int(material_info['width']*1000)}×{int(material_info['height']*1000)} mm",
+        "volume": round(volume, 3),
+        "quantity": quantity,
+        "per_cube": per_cube,
+        "cubes_needed": round(cubes_needed, 2)
+    }
+
+def format_simple_calculation_result(result: dict, material_type: str, length: float, width: float, height: float) -> str:
+    """Форматирование результата простого расчета"""
+    
+    material_names = {
+        "bricks": "Кирпич одинарный",
+        "gas_blocks": "Газобетонный блок", 
+        "foam_blocks": "Пеноблок",
+        "ceramic_blocks": "Керамический блок"
+    }
+    
+    material_name = material_names.get(material_type, "Материал")
+    
+    text = f"""
+⚡ ПРОСТОЙ РАСЧЕТ - РЕЗУЛЬТАТ
+
+📏 <b>Размеры конструкции:</b>
+• {length} × {width} × {height} м
+• Объем: {result['volume']} м³
+
+🧱 <b>Материал:</b>
+• {material_name}
+• Размер: {result['material_size']}
+
+📊 <b>Результат:</b>
+• <b>Количество: {result['quantity']} штук</b>
+• В 1 м³: {result['per_cube']} шт.
+• Кубов материала: {result['cubes_needed']} м³
+
+💡 <b>Рекомендации:</b>
+• Добавьте 5-10% на подрезку и бой
+• Для точного расчета используйте детальный калькулятор
+• Учитывайте проемы окон и дверей
+
+<i>Это базовый расчет. Для учета фронтонов, проемов и других параметров используйте детальный расчет.</i>
+"""
+    return text
+
+def format_bricks_result(result: dict) -> str:
+    """Форматирование результата для кирпича"""
+    return f"""
+🧱 РАСЧЕТ КИРПИЧА
+
+📊 Результаты расчета:
+
+| Периметр строения    | {result['perimeter']} | метров |
+| Общая площадь кладки | {result['wall_area']} | м² |
+| Толщина стены        | {result['wall_thickness']} | мм |
+| Количество кирпича   | {result['bricks_needed']} | шт |
+| Вес 1 кирпича        | {result['brick_weight']} | кг |
+| Общий вес кирпича    | {result['total_weight']} | кг |
+| Общий объем кирпича  | {result['total_volume']} | м³ |
+| Количество кирпича в кубе | {result['bricks_per_cube']} | шт/м³ |
+| Кол-во раствора на всю кладку | {result['mortar_volume']} | м³ |
+| Примерный вес раствора | {result['mortar_weight']} | кг |
+| Оптимальная высота стены | {result['optimal_height']} | см |
+| Кол-во рядов кирпича с учетом швов | {result['rows_count']} | рядов |
+| Кол-во кладочной сетки | {result['mesh_length']} | метров |
+| Примерный вес готовых стен | {result['total_wall_weight']} | кг |
+| Нагрузка на фундамент от стен | {result['foundation_load']} | кг/см² |
+
+📏 Параметры материала:
+• Размеры: {result['brick_dimensions']}
+
+💡 Рекомендации:
+• Добавьте 5-7% на подрезку и бой
+• Учитывайте нагрузку на фундамент
+• Для точности замерьте фактические размеры кирпича
+"""
+
+def format_wall_blocks_result(result: dict) -> str:
+    """Форматирование для стеновых блоков"""
+    return f"""
+🏗️ РАСЧЕТ СТЕНОВЫХ БЛОКОВ
+
+📊 Результаты расчета:
+
+| Периметр строения    | {result['perimeter']} | метров |
+| Общая площадь кладки | {result['wall_area']} | м² |
+| Толщина стены        | {result['wall_thickness']} | мм |
+| Количество блоков    | {result['blocks_needed']} | шт |
+| Общий вес блоков     | {result['total_weight']} | кг |
+| Общий объем блоков   | {result['total_volume']} | м³ |
+| Количество блоков в кубе | {result['blocks_per_cube']} | шт/м³ |
+| Общая стоимость блоков | {result['total_cost']} | руб |
+| Кол-во раствора на всю кладку | {result['mortar_volume']} | м³ |
+| Примерный вес раствора | {result['mortar_weight']} | кг |
+| Оптимальная высота стены | {result['optimal_height']} | см |
+| Кол-во рядов блоков с учетом швов | {result['rows_count']} | рядов |
+| Кол-во кладочной сетки | {result['mesh_length']} | метров |
+| Примерный вес готовых стен | {result['total_wall_weight']} | кг |
+| Нагрузка на фундамент от стен | {result['foundation_load']} | кг/см² |
+
+📏 Параметры материала:
+• Размеры: {result['block_dimensions']}
+• Вес 1 блока: {result['block_weight']} кг
+
+💡 Рекомендации:
+• Добавьте 5-7% на подрезку и бой
+• Учитывайте нагрузку на фундамент
+• Для точности замерьте фактические размеры блоков
+"""
+
+def format_foam_blocks_result(result: dict) -> str:
+    """Форматирование результата для пеноблоков"""
+    return f"""
+🧱 РАСЧЕТ ПЕНОБЛОКОВ
+
+📊 Результаты расчета:
+
+| Периметр строения    | {result['perimeter']} | метров |
+| Общая площадь кладки | {result['wall_area']} | м² |
+| Толщина стены        | {result['wall_thickness']} | мм |
+| Количество блоков    | {result['blocks_needed']} | шт |
+| Общий вес блоков     | {result['total_weight']} | кг |
+| Общий объем блоков   | {result['total_volume']} | м³ |
+| Количество блоков в кубе | {result['blocks_per_cube']} | шт/м³ |
+| Общая стоимость блоков | {result['total_cost']} | руб |
+| Кол-во раствора на всю кладку | {result['mortar_volume']} | м³ |
+| Примерный вес раствора | {result['mortar_weight']} | кг |
+| Оптимальная высота стены | {result['optimal_height']} | см |
+| Кол-во рядов блоков с учетом швов | {result['rows_count']} | рядов |
+| Кол-во кладочной сетки | {result['mesh_length']} | метров |
+| Примерный вес готовых стен | {result['total_wall_weight']} | кг |
+| Нагрузка на фундамент от стен | {result['foundation_load']} | кг/см² |
+
+📏 Параметры материала:
+• Размеры: {result['block_dimensions']}
+• Плотность: {result['density']} кг/м³
+• Вес 1 блока: {result['block_weight']} кг
+
+💡 Рекомендации:
+• Добавьте 5-7% на подрезку и бой
+• Пеноблоки требуют защиты от влаги
+• Используйте специальный клей для тонких швов
+• Учитывайте низкую теплопроводность при расчете толщины стен
+"""
+
+def format_gas_blocks_result(result: dict) -> str:
+    """Форматирование результата для газобетонных блоков"""
+    return f"""
+🏗️ РАСЧЕТ ГАЗОБЕТОННЫХ БЛОКОВ
+
+📊 Результаты расчета:
+
+| Периметр строения    | {result['perimeter']} | метров |
+| Общая площадь кладки | {result['wall_area']} | м² |
+| Толщина стены        | {result['wall_thickness']} | мм |
+| Количество блоков    | {result['blocks_needed']} | шт |
+| Общий вес блоков     | {result['total_weight']} | кг |
+• Общий объем блоков   | {result['total_volume']} | м³ |
+| Количество блоков в кубе | {result['blocks_per_cube']} | шт/м³ |
+| Общая стоимость блоков | {result['total_cost']} | руб |
+| Кол-во раствора на всю кладку | {result['mortar_volume']} | м³ |
+| Примерный вес раствора | {result['mortar_weight']} | кг |
+| Расчетная высота стены с учетом швов | {result['optimal_height']} | см |
+| Кол-во рядов блоков с учетом швов | {result['rows_count']} | рядов |
+| Кол-во кладочной сетки | {result['mesh_length']} | метров |
+| Примерный вес готовых стен | {result['total_wall_weight']} | кг |
+| Нагрузка на фундамент от стен | {result['foundation_load']} | кг/см² |
+
+📏 Параметры материала:
+• Размеры: {result['block_dimensions']}
+• Плотность: {result['density']} кг/м³
+• Вес 1 блока: {result['block_weight']} кг
+
+💡 Рекомендации:
+• Добавьте 5-7% на подрезку и бой
+• Газобетон требует обязательной отделки от влаги
+• Используйте специальный клей для тонких швов
+• Отличная теплоизоляция позволяет делать стены тоньше
+• Легкий материал - меньше нагрузка на фундамент
+"""
+
+def format_ceramic_blocks_result(result: dict) -> str:
+    """Форматирование результата для керамических блоков"""
+    return f"""
+🧱 РАСЧЕТ КЕРАМИЧЕСКИХ БЛОКОВ
+
+📊 Результаты расчета:
+
+| Количество керамоблоков | {result['blocks_needed']} | шт |
+| Общий объем керамоблоков | {result['total_volume']} | м³ |
+| Периметр строения    | {result['perimeter']} | метров |
+| Общая площадь кладки | {result['wall_area']} | м² |
+| Толщина стены        | {result['wall_thickness']} | мм |
+| Вес 1 блока          | {result['block_weight']} | кг |
+| Общий вес керамоблоков | {result['total_weight']} | кг |
+| Количество керамоблоков в кубе | {result['blocks_per_cube']} | шт/м³ |
+| Кол-во раствора на всю кладку | {result['mortar_volume']} | м³ |
+| Примерный вес раствора | {result['mortar_weight']} | кг |
+| Оптимальная высота стены | {result['optimal_height']} | см |
+| Кол-во рядов блоков с учетом швов | {result['rows_count']} | рядов |
+| Кол-во кладочной сетки | {result['mesh_length']} | метров |
+| Примерный вес готовых стен | {result['total_wall_weight']} | кг |
+| Нагрузка на фундамент от стен | {result['foundation_load']} | кг/см² |
+
+📏 Параметры материала:
+• Размеры: {result['block_dimensions']}
+• Вес 1 блока: {result['block_weight']} кг
+
+"""
+
+def format_general_result(result: dict) -> str:
+    """Общее форматирование результата"""
+    if "error" in result:
+        return f"❌ Ошибка расчета: {result['error']}"
+    
+    material_type = result.get('material_type', 'материала')
+    
+    return f"""
+📊 РЕЗУЛЬТАТ РАСЧЕТА {material_type.upper()}
+
+Основные параметры:
+• Периметр: {result.get('perimeter', 0)} м
+• Площадь кладки: {result.get('wall_area', 0)} м²
+• Толщина стены: {result.get('wall_thickness', 0)} мм
+• Количество: {result.get('bricks_needed', result.get('blocks_needed', 0))} шт
+• Общий вес: {result.get('total_weight', 0)} кг
+• Объем материала: {result.get('total_volume', 0)} m³
+
+💡 Для детального отчета используйте специализированный калькулятор для конкретного материала.
+"""
+
+# Клавиатуры
+def get_main_keyboard(user_id: int):
+    web_app_url = f"https://yandex.ru/maps/?ll=44.060119%2C56.221272&mode=poi&poi%5Bpoint%5D=44.057594%2C56.221962&poi%5Buri%5D=ymapsbm1%3A%2F%2Forg%3Foid%3D195684583654&source=serp_navig&z=16.34"
+    calculator_web_app_url = "https://stroy-calc.ru/"  # ЗАМЕНИТЕ НА РЕАЛЬНЫЙ URL
+    
+    keyboard = [
+        # Базовые функции (2 в ряд) - основные возможности бота
+        [InlineKeyboardButton(text="📊 Прайс-лист", callback_data="price"),
+         InlineKeyboardButton(text="🧮 Калькулятор в боте", callback_data="calculation")],
+        
+        # Веб-функции (2 в ряд) - внешние сервисы
+        [InlineKeyboardButton(text="🌐 Веб-калькулятор", web_app=WebAppInfo(url=calculator_web_app_url)),
+         InlineKeyboardButton(text="🗺️ Наш магазин", web_app=WebAppInfo(url=web_app_url))],
+    ]
+    
+    # Служебные функции (отдельные ряды для лучшей визуальной иерархии)
+    additional_buttons = []
+    
+    if is_staff(user_id):
+        additional_buttons.append([InlineKeyboardButton(text="📦 Управление товарами", callback_data="products_panel")])
+    
+    if is_admin(user_id):
+        additional_buttons.append([InlineKeyboardButton(text="⚙️ Админ-панель", callback_data="admin_panel")])
+    
+    # Добавляем служебные кнопки в конец
+    keyboard.extend(additional_buttons)
+    
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_price_categories_keyboard():
+    categories = get_product_categories()
+    keyboard = []
+    
+    # Группируем по 2 кнопки в ряд с минимальными эмодзи
+    for i in range(0, len(categories), 2):
+        row = []
+        if i < len(categories):
+            row.append(InlineKeyboardButton(
+                text=f"{categories[i].capitalize()}", 
+                callback_data=f"category_{categories[i]}"
+            ))
+        if i + 1 < len(categories):
+            row.append(InlineKeyboardButton(
+                text=f"{categories[i+1].capitalize()}", 
+                callback_data=f"category_{categories[i+1]}"
+            ))
+        if row:
+            keyboard.append(row)
+    
+    keyboard.append([InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_price_pagination_keyboard(category: str, page: int, total_pages: int):
+    buttons = []
+    
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"page_{category}_{page-1}"))
+        
+        nav_buttons.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="current"))
+        
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"page_{category}_{page+1}"))
+        
+        buttons.append(nav_buttons)
+    
+    buttons.append([InlineKeyboardButton(text="📂 К категориям", callback_data="back_to_categories")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_main")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_calculation_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧱 Кирпич", callback_data="calc_bricks"),
+         InlineKeyboardButton(text="🏗️ Газоблоки", callback_data="calc_gas_blocks")],
+        [InlineKeyboardButton(text="🧱 Пеноблоки", callback_data="calc_foam_blocks"),
+         InlineKeyboardButton(text="🏗️ Керамоблоки", callback_data="calc_ceramic_blocks")],
+        [InlineKeyboardButton(text="🧱 Стеновые блоки", callback_data="calc_wall_blocks")],
+        [InlineKeyboardButton(text="🎯 Расширенный расчет", callback_data="advanced_calculation")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_main")]
+    ])
+
+def get_brick_type_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧱 Одинарный", callback_data="brick_single"),
+         InlineKeyboardButton(text="🧱 Полуторный", callback_data="brick_one_half")],
+        [InlineKeyboardButton(text="🧱 Двойный", callback_data="brick_double")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_calc")]
+    ])
+
+def get_products_panel_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
+        [InlineKeyboardButton(text="✏️ Редактировать товар", callback_data="admin_edit_product")],
+        [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="admin_delete_product")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_main")]
+    ])
+
+def get_admin_panel_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Сотрудники", callback_data="manage_staff"),
+         InlineKeyboardButton(text="📊 Статистика", callback_data="detailed_stats")],
+        [InlineKeyboardButton(text="📝 Журнал аудита", callback_data="audit_log")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_main")]
+    ])
+
+def get_staff_management_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить сотрудника", callback_data="add_staff"),
+         InlineKeyboardButton(text="👥 Список сотрудников", callback_data="list_staff")],
+        [InlineKeyboardButton(text="🗑️ Удалить сотрудника", callback_data="remove_staff")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")]
+    ])
+
+def get_admin_products_keyboard(page: int = 1, per_page: int = 8):
+    products = get_all_products()
+    total_pages = (len(products) + per_page - 1) // per_page
+    
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
+    paginated_products = products[start_idx:end_idx]
+    
+    keyboard = []
+    
+    # Группируем товары по 2 в ряд
+    for i in range(0, len(paginated_products), 2):
+        row = []
+        if i < len(paginated_products):
+            product = paginated_products[i]
+            row.append(InlineKeyboardButton(
+                text=f"📦 {product[1][:15]}...", 
+                callback_data=f"admin_product_{product[0]}"
+            ))
+        if i + 1 < len(paginated_products):
+            product = paginated_products[i+1]
+            row.append(InlineKeyboardButton(
+                text=f"📦 {product[1][:15]}...", 
+                callback_data=f"admin_product_{product[0]}"
+            ))
+        if row:
+            keyboard.append(row)
+    
+    # Пагинация
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"products_page_{page-1}"))
+        
+        nav_buttons.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="current"))
+        
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"products_page_{page+1}"))
+        
+        keyboard.append(nav_buttons)
+    
+    keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="products_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_edit_product_keyboard(product_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Название", callback_data=f"edit_name_{product_id}")],
+        [InlineKeyboardButton(text="💰 Цена", callback_data=f"edit_price_{product_id}")],
+        [InlineKeyboardButton(text="📦 Количество", callback_data=f"edit_quantity_{product_id}")],
+        [InlineKeyboardButton(text="📂 Категория", callback_data=f"edit_category_{product_id}")],
+        [InlineKeyboardButton(text="📏 Единица измерения", callback_data=f"edit_unit_{product_id}")],
+        [InlineKeyboardButton(text="📝 Описание", callback_data=f"edit_description_{product_id}")],
+        [InlineKeyboardButton(text="◀️ Назад к товарам", callback_data="admin_edit_product_1")]
+    ])
+
+def get_staff_list_keyboard(page: int = 1, per_page: int = 8):
+    staff_list = get_all_staff()
+    total_pages = (len(staff_list) + per_page - 1) // per_page
+    
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
+    paginated_staff = staff_list[start_idx:end_idx]
+    
+    keyboard = []
+    
+    # Группируем сотрудников по 2 в ряд
+    for i in range(0, len(paginated_staff), 2):
+        row = []
+        if i < len(paginated_staff):
+            staff = paginated_staff[i]
+            display_name = staff[3] or staff[2] or f"ID:{staff[1]}"
+            row.append(InlineKeyboardButton(
+                text=f"👤 {display_name[:12]}", 
+                callback_data=f"staff_info_{staff[1]}"
+            ))
+        if i + 1 < len(paginated_staff):
+            staff = paginated_staff[i+1]
+            display_name = staff[3] or staff[2] or f"ID:{staff[1]}"
+            row.append(InlineKeyboardButton(
+                text=f"👤 {display_name[:12]}", 
+                callback_data=f"staff_info_{staff[1]}"
+            ))
+        if row:
+            keyboard.append(row)
+    
+    # Пагинация
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"staff_page_{page-1}"))
+        
+        nav_buttons.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="current"))
+        
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"staff_page_{page+1}"))
+        
+        keyboard.append(nav_buttons)
+    
+    keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="manage_staff")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_remove_staff_keyboard(page: int = 1, per_page: int = 8):
+    staff_list = get_all_staff()
+    total_pages = (len(staff_list) + per_page - 1) // per_page
+    
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
+    paginated_staff = staff_list[start_idx:end_idx]
+    
+    keyboard = []
+    
+    # Группируем сотрудников по 2 в ряд
+    for i in range(0, len(paginated_staff), 2):
+        row = []
+        if i < len(paginated_staff):
+            staff = paginated_staff[i]
+            display_name = staff[3] or staff[2] or f"ID:{staff[1]}"
+            row.append(InlineKeyboardButton(
+                text=f"🗑️ {display_name[:10]}", 
+                callback_data=f"remove_staff_{staff[1]}"
+            ))
+        if i + 1 < len(paginated_staff):
+            staff = paginated_staff[i+1]
+            display_name = staff[3] or staff[2] or f"ID:{staff[1]}"
+            row.append(InlineKeyboardButton(
+                text=f"🗑️ {display_name[:10]}", 
+                callback_data=f"remove_staff_{staff[1]}"
+            ))
+        if row:
+            keyboard.append(row)
+    
+    # Пагинация
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"remove_staff_page_{page-1}"))
+        
+        nav_buttons.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="current"))
+        
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"remove_staff_page_{page+1}"))
+        
+        keyboard.append(nav_buttons)
+    
+    keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="manage_staff")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_audit_log_keyboard(page: int = 1, per_page: int = 5):
+    audit_log = get_audit_log(100)
+    total_pages = (len(audit_log) + per_page - 1) // per_page
+    
+    keyboard = []
+    
+    # Пагинация
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"audit_page_{page-1}"))
+        
+        nav_buttons.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="current"))
+        
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"audit_page_{page+1}"))
+        
+        keyboard.append(nav_buttons)
+    
+    keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="audit_log_1")])
+    keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_wall_thickness_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="0.5 (половина)", callback_data="thickness_0.5"),
+         InlineKeyboardButton(text="1.0 (в материал)", callback_data="thickness_1.0")],
+        [InlineKeyboardButton(text="1.5 (полтора)", callback_data="thickness_1.5"),
+         InlineKeyboardButton(text="2.0 (два)", callback_data="thickness_2.0")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_calc")]
+    ])
+
+def get_mortar_thickness_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="2 мм (клей)", callback_data="mortar_2"),
+         InlineKeyboardButton(text="3 мм (пена)", callback_data="mortar_3")],
+        [InlineKeyboardButton(text="10 мм (раствор)", callback_data="mortar_10"),
+         InlineKeyboardButton(text="15 мм (раствор)", callback_data="mortar_15")],
+        [InlineKeyboardButton(text="20 мм (раствор)", callback_data="mortar_20")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_calc")]
+    ])
+
+def get_mesh_frequency_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Каждый ряд", callback_data="mesh_1"),
+         InlineKeyboardButton(text="Через ряд", callback_data="mesh_2")],
+        [InlineKeyboardButton(text="Через 2 ряда", callback_data="mesh_3"),
+         InlineKeyboardButton(text="Через 3 ряда", callback_data="mesh_4")],
+        [InlineKeyboardButton(text="Через 4 ряда", callback_data="mesh_5"),
+         InlineKeyboardButton(text="Не нужна", callback_data="mesh_0")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_calc")]
+    ])
+
+def get_density_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="D250", callback_data="density_250"),
+         InlineKeyboardButton(text="D300", callback_data="density_300")],
+        [InlineKeyboardButton(text="D350", callback_data="density_350"),
+         InlineKeyboardButton(text="D400", callback_data="density_400")],
+        [InlineKeyboardButton(text="D500", callback_data="density_500"),
+         InlineKeyboardButton(text="D600", callback_data="density_600")],
+        [InlineKeyboardButton(text="D700", callback_data="density_700"),
+         InlineKeyboardButton(text="D800", callback_data="density_800")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_calc")]
+    ])
+
+def get_confirmation_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Рассчитать", callback_data="confirm_calculation")],
+        [InlineKeyboardButton(text="✏️ Изменить параметры", callback_data="edit_parameters")],
+        [InlineKeyboardButton(text="🔄 Начать заново", callback_data="restart_calculation")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_main")]
+    ])
+
+def get_category_keyboard():
+    categories = get_product_categories()
+    keyboard = []
+    
+    # Группируем по 2 кнопки в ряд
+    for i in range(0, len(categories), 2):
+        row = []
+        if i < len(categories):
+            row.append(InlineKeyboardButton(
+                text=f"📂 {categories[i].capitalize()}", 
+                callback_data=f"select_category_{categories[i]}"
+            ))
+        if i + 1 < len(categories):
+            row.append(InlineKeyboardButton(
+                text=f"📂 {categories[i+1].capitalize()}", 
+                callback_data=f"select_category_{categories[i+1]}"
+            ))
+        if row:
+            keyboard.append(row)
+    
+    keyboard.append([InlineKeyboardButton(text="➕ Новая категория", callback_data="new_category")])
+    keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="cancel_add_product")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_simple_calculation_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧱 Кирпич", callback_data="simple_calc_bricks"),
+         InlineKeyboardButton(text="🏗️ Газоблоки", callback_data="simple_calc_gas_blocks")],
+        [InlineKeyboardButton(text="🧱 Пеноблоки", callback_data="simple_calc_foam_blocks"),
+         InlineKeyboardButton(text="🏗️ Керамоблоки", callback_data="simple_calc_ceramic_blocks")],
+        [InlineKeyboardButton(text="🧱 Стеновые блоки", callback_data="calc_wall_blocks")],
+        [InlineKeyboardButton(text="🎯 Детальный расчет", callback_data="detailed_calculation")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_main")]
+    ])
+
+def get_detailed_calculation_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧱 Кирпич", callback_data="calc_bricks"),
+         InlineKeyboardButton(text="🏗️ Газоблоки", callback_data="calc_gas_blocks")],
+        [InlineKeyboardButton(text="🧱 Пеноблоки", callback_data="calc_foam_blocks"),
+         InlineKeyboardButton(text="🏗️ Керамоблоки", callback_data="calc_ceramic_blocks")],
+        [InlineKeyboardButton(text="🧱 Стеновые блоки", callback_data="calc_wall_blocks")],
+        [InlineKeyboardButton(text="⚡ Простой расчет", callback_data="simple_calculation")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_main")]
+    ])
+
+# Вспомогательные функции
+async def show_products_page(callback: CallbackQuery, category: str, page: int):
+    products, total = get_products_by_category(category, page)
+    total_pages = max(1, (total + 4) // 5)
+    
+    if page < 1:
+        page = 1
+    elif page > total_pages:
+        page = total_pages
+    
+    # Более чистый заголовок
+    products_text = f"📦 **{category.upper()}** - Страница {page}/{total_pages}\n\n"
+    
+    for i, product in enumerate(products, 1):
+        products_text += f"**{i}. {product[1]}**\n"
+        products_text += f"   • Цена: {product[2]:.2f} руб./{product[5]}\n"
+        products_text += f"   • В наличии: {product[3]} {product[5]}\n"
+        
+        # Добавляем описание только если оно есть и не слишком длинное
+        if product[6] and len(product[6]) < 100:
+            products_text += f"   • Описание: {product[6]}\n"
+        
+        products_text += "   ───────────────────\n"
+    
+    await callback.message.edit_text(products_text, parse_mode="Markdown", reply_markup=get_price_pagination_keyboard(category, page, total_pages))
+
+async def ask_perimeter(message: Message, state: FSMContext):
+    await message.answer("""
+🏠 <b>Шаг 6: Периметр строения</b>
+
+Введите общую длину всех стен в метрах:
+
+Например:
+• Дом 7×8 м: периметр = 7+7+8+8 = 30 м
+• Гараж 6×4 м: периметр = 6+6+4+4 = 20 м
+• Баня 3×4 м: периметр = 3+3+4+4 = 14 м
+
+Введите периметр в метрах:
+""", parse_mode="HTML")
+    await state.set_state(CalculationState.entering_perimeter)
+
+async def ask_about_gables(message: Message, state: FSMContext):
+    await message.answer("""
+🔺 <b>Шаг 10: Фронтоны (необязательно)</b>
+
+Есть ли в вашем строении фронтоны (треугольные стены под крышей)?
+
+Фронтоны увеличивают расход материала и должны учитываться в расчете.
+""", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, есть фронтоны", callback_data="gables_yes")],
+        [InlineKeyboardButton(text="❌ Нет фронтонов", callback_data="gables_no")]
+    ]))
+    await state.set_state(CalculationState.asking_gables)
+
+async def ask_about_openings(message: Message, state: FSMContext):
+    await message.answer("""
+🚪🪟 <b>Шаг 11: Окна и двери (необязательно)</b>
+
+Нужно ли вычесть из расчета площадь окон и дверей?
+
+Это позволит точнее рассчитать количество материала.
+""", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, учесть проемы", callback_data="openings_yes")],
+        [InlineKeyboardButton(text="❌ Нет, не учитывать", callback_data="openings_no")]
+    ]))
+    await state.set_state(CalculationState.asking_openings)
+
+async def ask_about_mesh(message: Message, state: FSMContext):
+    await message.answer("""
+🕸️ <b>Шаг 12: Кладочная сетка (необязательно)</b>
+
+Нужна ли кладочная сетка для армирования?
+
+Сетка повышает прочность кладки и обычно используется:
+• В каждом 3-4 ряду для кирпича
+• В каждом 2-3 ряду для блоков
+• В сейсмически активных районах
+""", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, нужна сетка", callback_data="mesh_yes")],
+        [InlineKeyboardButton(text="❌ Нет, не нужна", callback_data="mesh_no")]
+    ]))
+    await state.set_state(CalculationState.asking_mesh)
+
+async def ask_about_price(message: Message, state: FSMContext):
+    data = await state.get_data()
+    material_type = data.get('material_type')
+    
+    price_units = {
+        'bricks': 'за штуку',
+        'ceramic_blocks': 'за штуку',
+        'wall_blocks': 'за штуку',
+        'foam_blocks': 'за кубометр',
+        'gas_blocks': 'за кубометр'
+    }
+    
+    unit = price_units.get(material_type, 'за единицу')
+    
+    await message.answer(f"""
+💰 <b>Шаг 13: Стоимость (необязательно)</b>
+
+Хотите рассчитать общую стоимость материала?
+
+Укажите цену {unit} или отправьте "-" для пропуска.
+""", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Указать цену", callback_data="price_yes")],
+        [InlineKeyboardButton(text="❌ Пропустить", callback_data="price_no")]
+    ]))
+    await state.set_state(CalculationState.asking_price)
+
+async def show_calculation_summary(message: Message, state: FSMContext):
+    data = await state.get_data()
+    params = data.get('calculation_params', {})
+    material_type = data.get('material_type')
+    
+    material_names = {
+        'bricks': 'Кирпич',
+        'wall_blocks': 'Стеновые блоки',
+        'foam_blocks': 'Пеноблоки', 
+        'gas_blocks': 'Газобетонные блоки',
+        'ceramic_blocks': 'Керамические блоки'
+    }
+    
+    material_name = material_names.get(material_type, material_type)
+    
+    # Формируем сводку параметров
+    summary = f"""
+📋 СВОДКА ПАРАМЕТРОВ
+
+🧱 Материал: {material_name}
+
+📏 Размеры:
+"""
+    
+    if material_type == 'bricks':
+        summary += f"• {params['brick_length']}×{params['brick_width']}×{params['brick_height']} мм\n"
+        summary += f"• Вес: {params.get('brick_weight', 'не указан')} кг\n"
+        if params.get('brick_pulsatility', 0) > 0:
+            summary += f"• Пустотность: {params['brick_pulsatility']}%\n"
+    else:
+        summary += f"• {params['block_length']}×{params['block_width']}×{params['block_height']} мм\n"
+        if 'density' in params:
+            summary += f"• Плотность: D{params['density']} кг/м³\n"
+    
+    summary += f"""
+
+🏠 Строение:
+• Периметр: {params['perimeter']} м
+• Высота стен: {params['wall_height']} см
+• Толщина стен: {params['wall_thickness']}
+• Толщина шва: {params['mortar_thickness']} мм
+
+"""
+    
+    # Фронтоны
+    if params.get('gables'):
+        summary += f"🔺 <b>Фронтоны:</b> {len(params['gables'])} шт.\n"
+        for i, gable in enumerate(params['gables'], 1):
+            summary += f"• Фронтон {i}: {gable['width']}×{gable['height']} см\n"
+        summary += "\n"
+    
+    # Проемы
+    if params.get('openings'):
+        windows = [o for o in params['openings'] if o['type'] == 'window']
+        doors = [o for o in params['openings'] if o['type'] == 'door']
+        
+        if windows:
+            summary += f"🪟 <b>Окна:</b> {len(windows)} типов\n"
+            for window in windows:
+                summary += f"• {window['count']} шт. {window['width']}×{window['height']} см\n"
+        
+        if doors:
+            summary += f"🚪 <b>Двери:</b> {len(doors)} типов\n"
+            for door in doors:
+                summary += f"• {door['count']} шт. {door['width']}×{door['height']} см\n"
+        summary += "\n"
+    
+    # Сетка
+    if params.get('mesh_frequency', 0) > 0:
+        frequency_names = {1: "каждый ряд", 2: "через ряд", 3: "через 2 ряда", 4: "через 3 ряда", 5: "через 4 ряда"}
+        summary += f"🕸️ <b>Кладочная сетка:</b> {frequency_names[params['mesh_frequency']]}\n\n"
+    
+    # Цена
+    if params.get('price', 0) > 0 or params.get('price_per_cube', 0) > 0:
+        price = params.get('price', params.get('price_per_cube', 0))
+        unit = "руб/шт" if material_type in ['bricks', 'ceramic_blocks', 'wall_blocks'] else "руб/м³"
+        summary += f"💰 **Цена:** {price} {unit}\n\n"
+    
+    summary += "Все параметры указаны верно?"
+    
+    await message.answer(summary, reply_markup=get_confirmation_keyboard())
+    await state.set_state(CalculationState.confirming_calculation)
+
+async def show_audit_log_page(callback: CallbackQuery, page: int = None):
+    if is_admin(callback.from_user.id):
+        if page is None:
+            page = int(callback.data.split("_")[2])
+        
+        audit_log = get_audit_log()
+        total_pages = (len(audit_log) + 4) // 5
+        
+        if page < 1:
+            page = 1
+        elif page > total_pages:
+            page = total_pages
+        
+        start_idx = (page - 1) * 5
+        end_idx = start_idx + 5
+        paginated_log = audit_log[start_idx:end_idx]
+        
+        log_text = "📝 АУДИТ ДЕЙСТВИЙ\n\n"
+        
+        for log in paginated_log:
+            log_text += f"⏰ {log[5]}\n"
+            log_text += f"👤 {log[2] or 'Пользователь'} (ID: {log[1]})\n"
+            log_text += f"📋 {log[3]}\n"
+            if log[4]:
+                log_text += f"📄 {log[4]}\n"
+            log_text += "─" * 30 + "\n"
+        
+        log_text += f"\nСтраница {page}/{total_pages}"
+        
+        await callback.message.edit_text(log_text, reply_markup=get_audit_log_keyboard(page))
+        log_audit(callback.from_user.id, callback.from_user.username, "view_audit", f"Просмотр аудита, страница {page}")
+
+# Обработчики команд
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    welcome_text = """
+🏗️ <b>Добро пожаловать в СтройГрадЪ-НН!</b>
+
+Я ваш персональный помощник для строительных материалов. Выберите нужный раздел:
+
+<b>📊 Основные функции:</b>
+• Прайс-лист - актуальные цены и наличие
+• Расчет в боте - калькулятор в боте (удобнее на сайте)
+
+<b>🌐 Дополнительные возможности:</b>
+• Веб-калькулятор - расширенная версия в браузере
+• Наш магазин - расположение на карте
+"""
+    
+    # Добавляем информацию о служебных функциях
+    if is_staff(message.from_user.id):
+        welcome_text += "\n<b>📦 Для сотрудников:</b>\n• Управление товарами"
+    
+    if is_admin(message.from_user.id):
+        welcome_text += "\n<b>⚙️ Для администраторов:</b>\n• Администрирование системы"
+    
+    welcome_text += "\n\n👇 <b>Выберите раздел:</b>"
+    
+    await message.answer(welcome_text, parse_mode="HTML", reply_markup=get_main_keyboard(message.from_user.id))
+    log_audit(message.from_user.id, message.from_user.username, "start", "Пользователь запустил бота")
+
+@dp.message(Command("прайс"))
+async def cmd_price(message: Message):
+    await show_categories(message)
+    log_audit(message.from_user.id, message.from_user.username, "price_command", "Использована команда прайса")
+
+@dp.message(Command("рассчет"))
+async def cmd_calculation(message: Message):
+    await show_calculation_options(message)
+    log_audit(message.from_user.id, message.from_user.username, "calculation_command", "Использована команда расчета")
+
+
+@dp.message(Command("add_staff"))
+async def cmd_add_staff(message: Message):
+    if is_admin(message.from_user.id):
+        try:
+            user_id = int(message.text.split()[1])
+            username = message.from_user.username
+            full_name = f"{message.from_user.first_name} {message.from_user.last_name or ''}".strip()
+            
+            if add_staff(user_id, username, full_name, message.from_user.id):
+                await message.answer("✅ Сотрудник успешно добавлен!")
+                log_audit(message.from_user.id, message.from_user.username, "add_staff", f"Добавлен сотрудник ID: {user_id}")
+            else:
+                await message.answer("❌ Ошибка при добавлении сотрудника (возможно, уже существует)")
+        except (IndexError, ValueError):
+            await message.answer("❌ Использование: /add_staff <ID_пользователя>")
+    else:
+        await message.answer("🚫 У вас нет прав администратора")
+
+# Обработчики callback-запросов
+@dp.callback_query(F.data == "back_to_main")
+async def back_to_main(callback: CallbackQuery):
+    welcome_text = """
+🏗️ <b>Добро пожаловать в СтройГрадЪ-НН!</b>
+
+Я ваш персональный помощник для строительных материалов. Выберите нужный раздел:
+
+<b>📊 Основные функции:</b>
+• Прайс-лист - актуальные цены и наличие
+• Расчет в боте - калькулятор в боте (удобнее на сайте)
+
+<b>🌐 Дополнительные возможности:</b>
+• Веб-калькулятор - расширенная версия в браузере
+• Наш магазин - расположение на карте
+"""
+    
+    # Добавляем информацию о служебных функциях
+    if is_staff(callback.from_user.id):
+        welcome_text += "\n<b>📦 Для сотрудников:</b>\n• Управление товарами"
+    
+    if is_admin(callback.from_user.id):
+        welcome_text += "\n<b>⚙️ Для администраторов:</b>\n• Администрирование системы"
+    
+    welcome_text += "\n\n👇 <b>Выберите раздел:</b>"
+    
+    await callback.message.edit_text(welcome_text, parse_mode="HTML", reply_markup=get_main_keyboard(callback.from_user.id))
+    await callback.answer()
+
+@dp.callback_query(F.data == "price")
+async def show_categories(callback: CallbackQuery):
+    categories_text = "**Выберите категорию товаров:**"
+    await callback.message.edit_text(categories_text, parse_mode="Markdown", reply_markup=get_price_categories_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("category_"))
+async def show_category_products(callback: CallbackQuery):
+    category = callback.data.split("_")[1]
+    await show_products_page(callback, category, 1)
+    await callback.answer()
+    log_audit(callback.from_user.id, callback.from_user.username, "view_category", f"Просмотр категории: {category}")
+
+@dp.callback_query(F.data.startswith("page_"))
+async def handle_pagination(callback: CallbackQuery):
+    data_parts = callback.data.split("_")
+    category = data_parts[1]
+    page = int(data_parts[2])
+    
+    await show_products_page(callback, category, page)
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_categories")
+async def back_to_categories(callback: CallbackQuery):
+    categories_text = "📋 Выберите категорию товаров:"
+    await callback.message.edit_text(categories_text, reply_markup=get_price_categories_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "calculation")
+async def show_calculation_options(callback: CallbackQuery):
+    calculation_text = """
+🧮 КАЛЬКУЛЯТОР СТРОИТЕЛЬНЫХ МАТЕРИАЛОВ
+
+Выберите режим расчета:
+
+🎯 <b>ДЕТАЛЬНЫЙ РАСЧЕТ</b>:
+
+📏 <b>Точные размеры материала:</b>
+• Любые размеры кирпича/блоков (не только стандартные)
+• Учет веса и пустотности кирпича
+• Выбор плотности блоков (D250-D800)
+
+🏗️ <b>Параметры строения:</b>
+• Периметр и высота стен
+• Выбор толщины кладки (0.5, 1, 1.5, 2 материала)
+• Тип раствора/клея и толщина швов
+
+🔺 <b>Архитектурные элементы:</b>
+• Фронтоны любых размеров (треугольные стены)
+• Окна и двери - точный вычет площади
+• Несколько типов проемов разных размеров
+
+🕸️ <b>Дополнительные материалы:</b>
+• Кладочная сетка с выбором периодичности
+• Расчет объема раствора/клея
+• Точное количество рядов кладки
+
+⚖️ <b>Инженерные расчеты:</b>
+• Общий вес конструкции
+• Нагрузка на фундамент (кН)
+• Рекомендации по прочности
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚡ <b>ПРОСТОЙ РАСЧЕТ</b> - быстрый результат:
+• Ввод только основных размеров (длина×ширина×высота)
+• Стандартные размеры материалов
+• Базовое количество без учета особенностей
+
+
+Какой режим выберете?
+"""
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 Детальный расчет", callback_data="detailed_calculation")],
+        [InlineKeyboardButton(text="⚡ Простой расчет", callback_data="simple_calculation")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_main")]
+    ])
+    
+    await callback.message.edit_text(calculation_text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+    log_audit(callback.from_user.id, callback.from_user.username, "view_calculator_menu", "Открыто меню выбора калькулятора")
+
+@dp.callback_query(F.data == "detailed_calculation")
+async def show_advanced_calculation(callback: CallbackQuery):
+    calculation_text = """
+🎯 ДЕТАЛЬНЫЙ КАЛЬКУЛЯТОР
+
+Выберите тип материала для точного расчета:
+
+• 🧱 <b>Кирпич</b> - все виды, размеры, пустотность
+• 🏗️ <b>Газобетонные блоки</b> - с плотностью и размерами
+• 🧱 <b>Пеноблоки</b> - с учетом плотности D250-D800
+• 🏗️ <b>Керамические блоки</b> - поризованная керамика
+
+<b>Детальный расчет включает:</b>
+✅ Индивидуальные размеры материала
+✅ Фронтоны и проемы
+✅ Кладочную сетку  
+✅ Расчет раствора
+✅ Нагрузку на фундамент
+✅ Итоговую стоимость
+"""
+    await callback.message.edit_text(calculation_text, parse_mode="HTML", reply_markup=get_detailed_calculation_keyboard())
+    await callback.answer()
+    log_audit(callback.from_user.id, callback.from_user.username, "view_detailed_calculator", "Открыт детальный калькулятор")
+
+@dp.callback_query(F.data == "simple_calculation")
+async def show_simple_calculation(callback: CallbackQuery):
+    calculation_text = """
+⚡ ПРОСТОЙ КАЛЬКУЛЯТОР
+
+Выберите тип материала для быстрого расчета:
+
+• 🧱 <b>Кирпич</b> - стандартные размеры
+• 🏗️ <b>Газобетонные блоки</b> - типовые блоки  
+• 🧱 <b>Пеноблоки</b> - стандартные размеры
+• 🏗️ <b>Керамические блоки</b> - популярные форматы
+
+<b>Простой расчет:</b>
+✅ Быстрый ввод размеров строения
+✅ Использование стандартных размеров материалов
+✅ Мгновенный результат
+"""
+    await callback.message.edit_text(calculation_text, parse_mode="HTML", reply_markup=get_simple_calculation_keyboard())
+    await callback.answer()
+    log_audit(callback.from_user.id, callback.from_user.username, "view_simple_calculator", "Открыт простой калькулятор")
+
+@dp.callback_query(F.data.startswith("simple_calc_"))
+async def start_simple_calculation(callback: CallbackQuery, state: FSMContext):
+    material_type = callback.data.replace("simple_calc_", "")
+    
+    material_names = {
+        "bricks": "кирпича",
+        "gas_blocks": "газобетонных блоков",
+        "foam_blocks": "пеноблоков", 
+        "ceramic_blocks": "керамических блоков"
+    }
+    
+    material_name = material_names.get(material_type, material_type)
+    
+    # Сохраняем тип материала
+    await state.update_data(simple_material_type=material_type)
+    
+    instruction_text = f"""
+⚡ ПРОСТОЙ РАСЧЕТ {material_name.upper()}
+
+📏 <b>Размеры конструкции</b>
+
+Введите длину конструкции в метрах:
+
+<b>Примеры:</b>
+• Стена: 10 м
+• Дом по периметру: 30 м  
+• Гараж: 20 м
+
+<b>Введите длину в метрах:</b>
+"""
+    
+    await callback.message.edit_text(instruction_text, parse_mode="HTML")
+    await state.set_state(SimpleCalculationState.entering_length)
+    await callback.answer()
+    log_audit(callback.from_user.id, callback.from_user.username, f"start_simple_{material_type}", f"Начат простой расчет {material_name}")
+
+@dp.message(SimpleCalculationState.entering_length)
+async def handle_simple_length(message: Message, state: FSMContext):
+    try:
+        length = float(message.text.strip())
+        if length <= 0:
+            await message.answer("❌ Длина должна быть положительным числом. Введите длину в метрах:")
+            return
+            
+        await state.update_data(simple_length=length)
+        
+        await message.answer("""
+📏 <b>Ширина конструкции</b>
+
+Введите ширину (толщину стены) в метрах:
+
+<b>Типовые значения:</b>
+• Кирпич в полкирпича: 0.12 м
+• Кирпич в кирпич: 0.25 м
+• Блоки: 0.2-0.4 м
+
+<b>Введите ширину в метрах:</b>
+""", parse_mode="HTML")
+        await state.set_state(SimpleCalculationState.entering_width)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для длины:")
+
+@dp.message(SimpleCalculationState.entering_width)
+async def handle_simple_width(message: Message, state: FSMContext):
+    try:
+        width = float(message.text.strip())
+        if width <= 0:
+            await message.answer("❌ Ширина должна быть положительным числом. Введите ширину в метры:")
+            return
+            
+        await state.update_data(simple_width=width)
+        
+        await message.answer("""
+📏 <b>Высота конструкции</b>
+
+Введите высоту в метры:
+
+<b>Типовые значения:</b>
+• Стена дома: 2.5-3.0 м
+• Забор: 1.5-2.0 м
+• Подвал: 2.0-2.5 м
+
+<b>Введите высоту в метрах:</b>
+""", parse_mode="HTML")
+        await state.set_state(SimpleCalculationState.entering_height)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для ширины:")
+
+@dp.message(SimpleCalculationState.entering_height)
+async def handle_simple_height(message: Message, state: FSMContext):
+    try:
+        height = float(message.text.strip())
+        if height <= 0:
+            await message.answer("❌ Высота должна быть положительным числом. Введите высоту в метры:")
+            return
+            
+        # Получаем все данные
+        user_data = await state.get_data()
+        material_type = user_data['simple_material_type']
+        length = user_data['simple_length']
+        width = user_data['simple_width']
+        
+        # Выполняем простой расчет
+        result = perform_simple_calculation(material_type, length, width, height)
+        
+        # Форматируем результат
+        result_text = format_simple_calculation_result(result, material_type, length, width, height)
+        
+        # Клавиатура для результата
+        result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Новый расчет", callback_data="simple_calculation")],
+            [InlineKeyboardButton(text="🎯 Детальный расчет", callback_data="detailed_calculation")],
+            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_main")]
+        ])
+        
+        await message.answer(result_text, reply_markup=result_keyboard)
+        
+        # Логирование
+        log_audit(message.from_user.id, message.from_user.username, 
+                 f"simple_calculation_{material_type}", 
+                 f"Размеры: {length}x{width}x{height}м, Результат: {result.get('quantity', 0)} шт.")
+        
+        await state.clear()
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для высоты:")
+    except Exception as e:
+        await message.answer("❌ Произошла ошибка при расчете. Попробуйте еще раз.")
+        await state.clear()
+
+# Обработчики для детального калькулятора - КИРПИЧ
+@dp.callback_query(F.data == "calc_bricks")
+async def start_brick_calculation_handler(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(material_type="bricks", calculation_params={})
+    await state.set_state(CalculationState.choosing_material)
+    
+    instruction_text = """
+🧱 ДЕТАЛЬНЫЙ РАСЧЕТ КИРПИЧА
+
+📏 <b>Шаг 1: Размеры кирпича</b>
+
+Введите длину кирпича в миллиметрах:
+
+Примеры стандартных размеров:
+• Одинарный: 250 мм
+• Полуторный: 250 мм  
+• Двойный: 250 мм
+• Модульный: 288 мм
+
+<b>Введите длину в мм:</b>
+"""
+    await callback.message.edit_text(instruction_text, parse_mode="HTML")
+    await state.set_state(CalculationState.entering_brick_length)
+    await callback.answer()
+    log_audit(callback.from_user.id, callback.from_user.username, "start_brick_calculation", "Начат детальный расчет кирпича")
+
+@dp.message(CalculationState.entering_brick_length)
+async def handle_brick_length_input(message: Message, state: FSMContext):
+    try:
+        length = float(message.text.strip())
+        if length <= 0:
+            await message.answer("❌ Длина должна быть положительным числом. Введите длину кирпича в мм:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['brick_length'] = length
+        await state.update_data(calculation_params=params)
+        
+        await message.answer("""
+📏 <b>Шаг 2: Ширина кирпича</b>
+
+Введите ширину кирпича в миллиметрах:
+
+Стандартные размеры:
+• Одинарный: 120 мм
+• Полуторный: 120 мм  
+• Двойный: 120 мм
+• Евро: 85 мм
+
+<b>Введите ширину:</b>
+""", parse_mode="HTML")
+        await state.set_state(CalculationState.entering_brick_width)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для длины кирпича:")
+
+@dp.message(CalculationState.entering_brick_width)
+async def handle_brick_width_input(message: Message, state: FSMContext):
+    try:
+        width = float(message.text.strip())
+        if width <= 0:
+            await message.answer("❌ Ширина должна быть положительным числом. Введите ширину кирпича в мм:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['brick_width'] = width
+        await state.update_data(calculation_params=params)
+        
+        await message.answer("""
+📏 <b>Шаг 3: Высота кирпича</b>
+
+Введите высоту кирпича в миллиметрах:
+
+Стандартные размеры:
+• Одинарный: 65 мм
+• Полуторный: 88 мм
+• Двойный: 140 мм
+
+<b>Введите высоту</b>:
+""", parse_mode="HTML")
+        await state.set_state(CalculationState.entering_brick_height)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для ширины кирпича:")
+
+@dp.message(CalculationState.entering_brick_height)
+async def handle_brick_height_input(message: Message, state: FSMContext):
+    try:
+        height = float(message.text.strip())
+        if height <= 0:
+            await message.answer("❌ Высота должна быть положительным числом. Введите высоту кирпича в мм:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['brick_height'] = height
+        await state.update_data(calculation_params=params)
+        
+        await message.answer("""
+⚖️  <b>Шаг 4: Вес кирпича (необязательно)</b>
+
+Введите вес одного кирпича в килограммах или отправьте "-" для пропуска:
+
+Средние значения:
+• Одинарный полнотелый: 3.3-3.6 кг
+• Полуторный полнотелый: 4.0-4.3 кг
+• Двойный полнотелый: 6.6-7.2 кг
+• Пустотелый: на 30-40% легче
+
+Введите вес или "-":
+""", parse_mode="HTML")
+        await state.set_state(CalculationState.entering_brick_weight)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для высоты кирпича:")
+
+@dp.message(CalculationState.entering_brick_weight)
+async def handle_brick_weight_input(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        
+        if message.text.strip() == "-":
+            # Используем средний вес
+            length = params['brick_length']
+            if length <= 250:
+                params['brick_weight'] = 3.5  # Средний вес одинарного
+            else:
+                params['brick_weight'] = 4.2  # Средний вес полуторного/двойного
+        else:
+            weight = float(message.text.strip())
+            if weight <= 0:
+                await message.answer("❌ Вес должен быть положительным числом. Введите вес кирпича в кг или '-':")
+                return
+            params['brick_weight'] = weight
+            
+        await state.update_data(calculation_params=params)
+        
+        await message.answer("""
+🕳️ <b>Шаг 5: Пустотность кирпича (необязательно)</b>
+
+Введите процент пустотности или отправьте "-" для пропуска:
+
+Типовые значения:
+• Полнотелый: 0-13%
+• Условно-полнотелый: 14-20%
+• Пустотелый: 21-45%
+• Высокопустотный: 46-60%
+
+Введите процент (0-60) или "-":
+""", parse_mode="HTML")
+        await state.set_state(CalculationState.entering_brick_pulsatility)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для веса кирпича или '-' для пропуска:")
+
+@dp.message(CalculationState.entering_brick_pulsatility)
+async def handle_brick_pulsatility_input(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        
+        if message.text.strip() == "-":
+            params['brick_pulsatility'] = 0  # Полнотелый по умолчанию
+        else:
+            pulsatility = float(message.text.strip())
+            if pulsatility < 0 or pulsatility > 60:
+                await message.answer("❌ Пустотность должна быть от 0 до 60%. Введите процент или '-':")
+                return
+            params['brick_pulsatility'] = pulsatility
+            
+        await state.update_data(calculation_params=params)
+        await ask_perimeter(message, state)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для пустотности кирпича или '-' для пропуска:")
+
+# Обработчики для детального калькулятора - СТЕНОВЫЕ БЛОКИ
+@dp.callback_query(F.data == "calc_wall_blocks")
+async def start_wall_blocks_calculation_handler(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(material_type="wall_blocks", calculation_params={})
+    await state.set_state(CalculationState.choosing_material)
+    
+    instruction_text = """
+🏗️ ДЕТАЛЬНЫЙ РАСЧЕТ СТЕНОВЫХ БЛОКОВ
+
+📏 <b>Шаг 1: Размеры блока</b>
+
+Введите длину блока в миллиметрах:
+
+Примеры стандартных размеров:
+• Керамзитобетонные: 390 мм
+• Шлакоблоки: 390 мм
+• Газобетонные: 600 мм
+• Пенобетонные: 600 мм
+
+<b>Введите длину в мм:</b>
+"""
+    
+    await callback.message.edit_text(instruction_text, parse_mode="HTML")
+    await state.set_state(CalculationState.entering_block_length)
+    await callback.answer()
+    log_audit(callback.from_user.id, callback.from_user.username, "start_wall_blocks_calculation", "Начат детальный расчет стеновых блоков")
+
+# Обработчики для детального калькулятора - ПЕНОБЛОКИ
+@dp.callback_query(F.data == "calc_foam_blocks")
+async def start_foam_blocks_calculation_handler(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(material_type="foam_blocks", calculation_params={})
+    await state.set_state(CalculationState.choosing_material)
+    
+    instruction_text = """
+🧱 ДЕТАЛЬНЫЙ РАСЧЕТ ПЕНОБЛОКОВ
+
+📏 <b>Шаг 1: Размеры блока</b>
+
+Введите длину пеноблока в миллиметрах:
+
+Стандартные размеры:
+• 600×300×200 мм
+• 600×400×200 мм  
+• 625×500×250 мм
+
+<b>Введите длину в мм:</b>
+"""
+    await callback.message.edit_text(instruction_text, parse_mode="HTML")
+    await state.set_state(CalculationState.entering_block_length)
+    await callback.answer()
+    log_audit(callback.from_user.id, callback.from_user.username, "start_foam_blocks_calculation", "Начат детальный расчет пеноблоков")
+
+# Обработчики для детального калькулятора - ГАЗОБЛОКИ
+@dp.callback_query(F.data == "calc_gas_blocks")
+async def start_gas_blocks_calculation_handler(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(material_type="gas_blocks", calculation_params={})
+    await state.set_state(CalculationState.choosing_material)
+    
+    instruction_text = """
+🏗️ ДЕТАЛЬНЫЙ РАСЧЕТ ГАЗОБЕТОННЫХ БЛОКОВ
+
+📏 <b>Шаг 1: Размеры блока</b>
+
+Введите длину газоблока в миллиметрах:
+
+Стандарные размеры:
+• 600×300×200 мм
+• 625×250×250 мм
+• 625×400×250 мм
+
+<b>Введите длину в мм:</b>
+"""
+    await callback.message.edit_text(instruction_text, parse_mode="HTML")
+    await state.set_state(CalculationState.entering_block_length)
+    await callback.answer()
+    log_audit(callback.from_user.id, callback.from_user.username, "start_gas_blocks_calculation", "Начат детальный расчет газобетонных блоков")
+
+# Обработчики для детального калькулятора - КЕРАМИЧЕСКИЕ БЛОКИ
+@dp.callback_query(F.data == "calc_ceramic_blocks")
+async def start_ceramic_blocks_calculation_handler(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(material_type="ceramic_blocks", calculation_params={})
+    await state.set_state(CalculationState.choosing_material)
+    
+    instruction_text = """
+🧱 ДЕТАЛЬНЫЙ РАСЧЕТ КЕРАМИЧЕСКИХ БЛОКОВ
+
+📏 <b>Шаг 1: Размеры блока</b>
+
+Введите длину керамического блока в миллиметрах:
+
+Стандартные размеры:
+• 510×250×219 мм (14.3 НФ)
+• 380×250×219 мм (10.7 НФ)
+• 510×120×219 мм (6.8 НФ)
+
+<b>Введите длину в мм:</b>
+"""
+    await callback.message.edit_text(instruction_text, parse_mode="HTML")
+    await state.set_state(CalculationState.entering_block_length)
+    await callback.answer()
+    log_audit(callback.from_user.id, callback.from_user.username, "start_ceramic_blocks_calculation", "Начат детальный расчет керамических блоков")
+
+# Общие обработчики для блоков
+@dp.message(CalculationState.entering_block_length)
+async def handle_block_length_input(message: Message, state: FSMContext):
+    try:
+        length = float(message.text.strip())
+        if length <= 0:
+            await message.answer("❌ Длина должна быть положительным числом. Введите длину блока в мм:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['block_length'] = length
+        await state.update_data(calculation_params=params)
+        
+        await message.answer("""
+📏 <b>Шаг 2: Ширина блока</b>
+
+Введите ширину блока в миллиметрах:
+
+Стандарные размеры:
+• Пеноблоки: 100-600 мм
+• Газоблоки: 75-500 мм  
+• Керамоблоки: 80-250 мм
+• Стеновые блоки: 190-400 мм
+
+Введите ширину:
+""", parse_mode="HTML")
+        await state.set_state(CalculationState.entering_block_width)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для длины блока:")
+
+@dp.message(CalculationState.entering_block_width)
+async def handle_block_width_input(message: Message, state: FSMContext):
+    try:
+        width = float(message.text.strip())
+        if width <= 0:
+            await message.answer("❌ Ширина должна быть положительным числом. Введите ширину блока в мм:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['block_width'] = width
+        await state.update_data(calculation_params=params)
+        
+        await message.answer("""
+📏 <b>Шаг 3: Высота блока</b>
+
+Введите высоту блока в миллиметрах:
+
+Стандарные размеры:
+• Пеноблоки: 200-600 мм
+• Газоблоки: 200-300 мм
+• Керамоблоки: 140-219 мм
+• Стеновые блоки: 188-400 мм
+
+Введите высоту:
+""", parse_mode="HTML")
+        await state.set_state(CalculationState.entering_block_height)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для ширины блока:")
+
+@dp.message(CalculationState.entering_block_height)
+async def handle_block_height_input(message: Message, state: FSMContext):
+    try:
+        height = float(message.text.strip())
+        if height <= 0:
+            await message.answer("❌ Высота должна быть положительным числом. Введите высоту блока в мм:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        material_type = data.get('material_type')
+        params['block_height'] = height
+        await state.update_data(calculation_params=params)
+        
+        # Для пеноблоков и газоблоков спрашиваем плотность
+        if material_type in ['foam_blocks', 'gas_blocks']:
+            await message.answer("""
+📊 <b>Шаг 4: Плотность блока</b>
+
+Выберите плотность блока:
+
+Стандартные значения:
+• D250 - для утепления
+• D300-D400 - для перегородок  
+• D500-D600 - для несущих стен
+• D700-D800 - для цоколей
+
+Выберите плотность:
+""", parse_mode="HTML", reply_markup=get_density_keyboard())
+            await state.set_state(CalculationState.entering_block_density)
+        # Для стеновых и керамических блоков спрашиваем вес
+        elif material_type in ['wall_blocks', 'ceramic_blocks']:
+            await message.answer("""
+⚖️ <b>Вес блока</b>
+
+Введите вес одного блока в килограммах:
+
+Примерные значения:
+• Керамзитобетонный блок 390x190x188: 14-16 кг
+• Керамический блок 510x250x219: 20-22 кг
+• Шлакоблок 390x190x188: 16-18 кг
+
+Введите вес в кг:
+""", parse_mode="HTML")
+            await state.set_state(CalculationState.entering_block_weight)
+        else:
+            await ask_perimeter(message, state)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для высоты блока:")
+
+@dp.callback_query(F.data.startswith("density_"))
+async def handle_density_selection_callback(callback: CallbackQuery, state: FSMContext):
+    density = int(callback.data.split("_")[1])
+    
+    data = await state.get_data()
+    params = data.get('calculation_params', {})
+    params['density'] = density
+    await state.update_data(calculation_params=params)
+    
+    await callback.message.edit_text(f"✅ Выбрана плотность D{density} кг/м³")
+    await ask_perimeter(callback.message, state)
+    await callback.answer()
+
+@dp.message(CalculationState.entering_block_weight)
+async def handle_block_weight_input(message: Message, state: FSMContext):
+    try:
+        weight = float(message.text.strip())
+        if weight <= 0:
+            await message.answer("❌ Вес должен быть положительным числом. Введите вес блока в кг:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['block_weight'] = weight
+        await state.update_data(calculation_params=params)
+        
+        await ask_perimeter(message, state)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для веса блока:")
+
+# Обработчики параметров строения
+@dp.message(CalculationState.entering_perimeter)
+async def handle_perimeter_input(message: Message, state: FSMContext):
+    try:
+        perimeter = float(message.text.strip())
+        if perimeter <= 0:
+            await message.answer("❌ Периметр должен быть положительным числом. Введите периметр в метры:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['perimeter'] = perimeter
+        await state.update_data(calculation_params=params)
+        
+        await message.answer("""
+📐 <b>Шаг 7: Высота стен</b>
+
+Введите высоту стен в сантиметрах:
+
+Типовые значения:
+• Одноэтажный дом: 250-300 см
+• Подвал/цоколь: 200-250 см
+• Мансарда: 150-200 см
+• Гараж: 240-280 см
+
+Если высота стен разная, укажите среднюю высоту.
+
+Введите высоту в сантиметрах:
+""", parse_mode="HTML")
+        await state.set_state(CalculationState.entering_wall_height)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для периметра:")
+
+@dp.message(CalculationState.entering_wall_height)
+async def handle_wall_height_input(message: Message, state: FSMContext):
+    try:
+        height = float(message.text.strip())
+        if height <= 0:
+            await message.answer("❌ Высота должна быть положительным числом. Введите высоту в см:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['wall_height'] = height
+        await state.update_data(calculation_params=params)
+        
+        await message.answer("""
+🧱 <b>Шаг 8: Толщина стен</b>
+
+Выберите толщину стен:
+""", parse_mode="HTML", reply_markup=get_wall_thickness_keyboard())
+        await state.set_state(CalculationState.choosing_wall_thickness)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для высоты стен:")
+
+@dp.callback_query(F.data.startswith("thickness_"))
+async def handle_wall_thickness_callback(callback: CallbackQuery, state: FSMContext):
+    thickness = float(callback.data.split("_")[1])
+    
+    data = await state.get_data()
+    params = data.get('calculation_params', {})
+    params['wall_thickness'] = thickness
+    await state.update_data(calculation_params=params)
+    
+    thickness_names = {
+        0.5: "половина материала",
+        1.0: "в материал", 
+        1.5: "полтора материала",
+        2.0: "два материала"
+    }
+    
+    await callback.message.edit_text(f"✅ Выбрана толщина: {thickness_names[thickness]}")
+    
+    await callback.message.answer("""
+🧪 <b>Шаг 9: Толщина раствора/клея</b>
+
+Выберите толщину кладочного шва:
+""", parse_mode="HTML", reply_markup=get_mortar_thickness_keyboard())
+    await state.set_state(CalculationState.choosing_mortar_thickness)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("mortar_"))
+async def handle_mortar_thickness_callback(callback: CallbackQuery, state: FSMContext):
+    thickness = int(callback.data.split("_")[1])
+    
+    data = await state.get_data()
+    params = data.get('calculation_params', {})
+    params['mortar_thickness'] = thickness
+    await state.update_data(calculation_params=params)
+    
+    mortar_names = {
+        2: "2 мм (тонкошовный клей)",
+        3: "3 мм (монтажная пена)",
+        10: "10 мм (цементный раствор)",
+        15: "15 мм (цементный раствор)",
+        20: "20 мм (цементный раствор)"
+    }
+    
+    await callback.message.edit_text(f"✅ Выбрана толщина шва: {mortar_names[thickness]}")
+    await ask_about_gables(callback.message, state)
+    await callback.answer()
+
+# Обработчики фронтонов
+@dp.callback_query(F.data == "gables_yes")
+async def handle_gables_yes_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("""
+🔺 <b>Количество фронтонов</b>
+
+Введите количество фронтонов (обычно 2):
+""", parse_mode="HTML")
+    await state.set_state(CalculationState.entering_gables_count)
+    await callback.answer()
+
+@dp.callback_query(F.data == "gables_no")
+async def handle_gables_no_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    params = data.get('calculation_params', {})
+    params['gables'] = []
+    await state.update_data(calculation_params=params)
+    
+    await callback.message.edit_text("✅ Фронтоны не учитываются")
+    await ask_about_openings(callback.message, state)
+    await callback.answer()
+
+@dp.message(CalculationState.entering_gables_count)
+async def handle_gables_count_input(message: Message, state: FSMContext):
+    try:
+        count = int(message.text.strip())
+        if count <= 0:
+            await message.answer("❌ Количество фронтонов должно быть положительным числом:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['gables_count'] = count
+        params['gables'] = []
+        params['current_gable'] = 1
+        await state.update_data(calculation_params=params)
+        
+        await message.answer(f"""
+📐 <b>Фронтон №1</b>
+
+Введите ширину основания фронтона в сантиметрах:
+
+Обычно равна ширине дома.
+Например, для дома 8×10 м ширина фронтона = 800 см
+
+Введите ширину в см:
+""", parse_mode="HTML")
+        await state.set_state(CalculationState.entering_gable_width)
+        
+    except ValueError:
+        await message.answer("❌ Введите целое число для количества фронтонов:")
+
+@dp.message(CalculationState.entering_gable_width)
+async def handle_gable_width_input(message: Message, state: FSMContext):
+    try:
+        width = float(message.text.strip())
+        if width <= 0:
+            await message.answer("❌ Ширина должна быть положительным числом. Введите ширину в см:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['current_gable_width'] = width
+        await state.update_data(calculation_params=params)
+        
+        current_gable = params['current_gable']
+        await message.answer(f"""
+📐 <b>Фронтон №{current_gable}</b>
+
+Введите высоту фронтона в сантиметры:
+
+Измеряется от основания до конька крыши.
+Типовые значения: 100-300 см
+
+Введите высоту в см:
+""", parse_mode="HTML")
+        await state.set_state(CalculationState.entering_gable_height)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для ширины фронтона:")
+
+@dp.message(CalculationState.entering_gable_height)
+async def handle_gable_height_input(message: Message, state: FSMContext):
+    try:
+        height = float(message.text.strip())
+        if height <= 0:
+            await message.answer("❌ Высота должна быть положительным числом. Введите высоту в см:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        
+        # Сохраняем текущий фронтон
+        gable = {
+            'width': params['current_gable_width'],
+            'height': height
+        }
+        params['gables'].append(gable)
+        
+        current_gable = params['current_gable']
+        gables_count = params['gables_count']
+        
+        if current_gable < gables_count:
+            # Переходим к следующему фронтону
+            params['current_gable'] = current_gable + 1
+            await state.update_data(calculation_params=params)
+            
+            await message.answer(f"""
+📐 <b>Фронтон №{current_gable + 1}</b>
+
+Введите ширину основания фронтона в сантиметрах:
+
+Введите ширину в см:
+""", parse_mode="HTML")
+            await state.set_state(CalculationState.entering_gable_width)
+        else:
+            # Все фронтоны введены
+            await state.update_data(calculation_params=params)
+            await message.answer(f"✅ Все {gables_count} фронтонов добавлены")
+            await ask_about_openings(message, state)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для высота фронтона:")
+
+# Обработчики проемов
+@dp.callback_query(F.data == "openings_yes")
+async def handle_openings_yes_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    params = data.get('calculation_params', {})
+    params['openings'] = []
+    await state.update_data(calculation_params=params)
+    
+    await callback.message.edit_text("""
+🪟 <b>Окна</b>
+
+Введите количество окон одного размера:
+
+Например: если у вас 4 окна размером 120×140 см, введите 4.
+Если окна разных размеров, сначала введите количество одинаковых.
+
+Введите количество окон:
+""", parse_mode="HTML")
+    await state.set_state(CalculationState.entering_windows_count)
+    await callback.answer()
+
+@dp.callback_query(F.data == "openings_no")
+async def handle_openings_no_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    params = data.get('calculation_params', {})
+    params['openings'] = []
+    await state.update_data(calculation_params=params)
+    
+    await callback.message.edit_text("✅ Проемы не учитываются")
+    await ask_about_mesh(callback.message, state)
+    await callback.answer()
+
+@dp.message(CalculationState.entering_windows_count)
+async def handle_windows_count_input(message: Message, state: FSMContext):
+    try:
+        count = int(message.text.strip())
+        if count <= 0:
+            await message.answer("❌ Количество окон должно быть положительным числом:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['current_windows_count'] = count
+        await state.update_data(calculation_params=params)
+        
+        await message.answer(f"""
+🪟 <b>Размеры окон ({count} шт.)</b>
+
+Введите ширину окна в сантиметрах:
+
+Стандартные размеры окон:
+• 60×60, 60×90, 60×120 см
+• 90×90, 90×120, 90×150 см  
+• 120×120, 120×140, 120×160 см
+• 150×120, 150×140, 150×160 см
+
+Введите ширину в см:
+""", parse_mode="HTML")
+        await state.set_state(CalculationState.entering_window_width)
+        
+    except ValueError:
+        await message.answer("❌ Введите целое число для количества окон:")
+
+@dp.message(CalculationState.entering_window_width)
+async def handle_window_width_input(message: Message, state: FSMContext):
+    try:
+        width = float(message.text.strip())
+        if width <= 0:
+            await message.answer("❌ Ширина должна быть положительным числом. Введите ширину в см:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['current_window_width'] = width
+        await state.update_data(calculation_params=params)
+        
+        count = params['current_windows_count']
+        await message.answer(f"""
+🪟 <b>Размеры окон ({count} шт.)</b>
+
+Введите высоту окна в сантиметрах:
+
+Введите высоту в см:
+""", parse_mode="HTML")
+        await state.set_state(CalculationState.entering_window_height)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для ширины окна:")
+
+@dp.message(CalculationState.entering_window_height)
+async def handle_window_height_input(message: Message, state: FSMContext):
+    try:
+        height = float(message.text.strip())
+        if height <= 0:
+            await message.answer("❌ Высота должна быть положительным числом. Введите высоту в см:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        
+        # Сохраняем окна
+        window = {
+            'width': params['current_window_width'],
+            'height': height,
+            'count': params['current_windows_count'],
+            'type': 'window'
+        }
+        params['openings'].append(window)
+        await state.update_data(calculation_params=params)
+        
+        count = params['current_windows_count']
+        width = params['current_window_width']
+        await message.answer(f"✅ Добавлено {count} окон размером {width}×{height} см")
+        
+        # Спрашиваем о других окнах
+        await message.answer("""
+🪟 <b>Есть ли окна других размеров?</b>
+""", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, есть еще", callback_data="more_windows_yes")],
+            [InlineKeyboardButton(text="❌ Нет, переходим к дверям", callback_data="more_windows_no")]
+        ]))
+        await state.set_state(CalculationState.asking_more_windows)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для высоты окна:")
+
+@dp.callback_query(F.data == "more_windows_yes")
+async def handle_more_windows_yes_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("""
+🪟 <b>Дополнительные окна</b>
+
+Введите количество окон следующего размера:
+""", parse_mode="HTML")
+    await state.set_state(CalculationState.entering_windows_count)
+    await callback.answer()
+
+@dp.callback_query(F.data == "more_windows_no")
+async def handle_more_windows_no_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("""
+🚪 <b>Двери</b>
+
+Введите количество дверей одного размера:
+
+Стандартные размеры дверей:
+• Входные: 90×200, 100×200 см
+• Межкомнатные: 60×200, 70×200, 80×200 см
+• Балконные: 70×210, 80×210 см
+
+Введите количество дверей:
+""", parse_mode="HTML")
+    await state.set_state(CalculationState.entering_doors_count)
+    await callback.answer()
+
+@dp.message(CalculationState.entering_doors_count)
+async def handle_doors_count_input(message: Message, state: FSMContext):
+    try:
+        count = int(message.text.strip())
+        if count <= 0:
+            await message.answer("❌ Количество дверей должно быть положительным числом:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['current_doors_count'] = count
+        await state.update_data(calculation_params=params)
+        
+        await message.answer(f"""
+🚪 <b>Размеры дверей ({count} шт.)</b>
+Введите ширину двери в сантиметрах:
+
+Введите ширину в см:
+""", parse_mode="HTML")
+        await state.set_state(CalculationState.entering_door_width)
+        
+    except ValueError:
+        await message.answer("❌ Введите целое число для количества дверей:")
+
+@dp.message(CalculationState.entering_door_width)
+async def handle_door_width_input(message: Message, state: FSMContext):
+    try:
+        width = float(message.text.strip())
+        if width <= 0:
+            await message.answer("❌ Ширина должна быть положительным числом. Введите ширина в см:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        params['current_door_width'] = width
+        await state.update_data(calculation_params=params)
+        
+        count = params['current_doors_count']
+        await message.answer(f"""
+🚪 <b>Размеры дверей ({count} шт.)</b>
+
+Введите высоту двери в сантиметрах:
+
+Введите высоту в см:
+""", parse_mode="HTML")
+        await state.set_state(CalculationState.entering_door_height)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для ширины двери:")
+
+@dp.message(CalculationState.entering_door_height)
+async def handle_door_height_input(message: Message, state: FSMContext):
+    try:
+        height = float(message.text.strip())
+        if height <= 0:
+            await message.answer("❌ Высота должна быть положительным числом. Введите высоту в см:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        
+        # Сохраняем двери
+        door = {
+            'width': params['current_door_width'],
+            'height': height,
+            'count': params['current_doors_count'],
+            'type': 'door'
+        }
+        params['openings'].append(door)
+        await state.update_data(calculation_params=params)
+        
+        count = params['current_doors_count']
+        width = params['current_door_width']
+        await message.answer(f"✅ Добавлено {count} дверей размером {width}×{height} см")
+        
+        # Спрашиваем о других дверям
+        await message.answer("""
+🚪 <b>Есть ли двери других размеров?</b>
+""", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, есть еще", callback_data="more_doors_yes")],
+            [InlineKeyboardButton(text="❌ Нет, продолжаем", callback_data="more_doors_no")]
+        ]))
+        await state.set_state(CalculationState.asking_more_doors)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для высоты двери:")
+
+@dp.callback_query(F.data == "more_doors_yes")
+async def handle_more_doors_yes_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("""
+🚪 <b>Дополнительные двери</b>
+
+Введите количество дверей следующего размера:
+""", parse_mode="HTML")
+    await state.set_state(CalculationState.entering_doors_count)
+    await callback.answer()
+
+@dp.callback_query(F.data == "more_doors_no")
+async def handle_more_doors_no_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("✅ Все проемы добавлены")
+    await ask_about_mesh(callback.message, state)
+    await callback.answer()
+
+# Обработчики кладочной сетки
+@dp.callback_query(F.data == "mesh_yes")
+async def handle_mesh_yes_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("""
+🕸️ <b>Периодичность кладочной сетки</b>
+
+Выберите, как часто укладывать сетку:
+""", parse_mode="HTML", reply_markup=get_mesh_frequency_keyboard())
+    await state.set_state(CalculationState.choosing_mesh_frequency)
+    await callback.answer()
+
+@dp.callback_query(F.data == "mesh_no")
+async def handle_mesh_no_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    params = data.get('calculation_params', {})
+    params['mesh_frequency'] = 0
+    await state.update_data(calculation_params=params)
+    
+    await callback.message.edit_text("✅ Кладочная сетка не используется")
+    await ask_about_price(callback.message, state)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("mesh_"))
+async def handle_mesh_frequency_callback(callback: CallbackQuery, state: FSMContext):
+    frequency = int(callback.data.split("_")[1])
+    
+    data = await state.get_data()
+    params = data.get('calculation_params', {})
+    params['mesh_frequency'] = frequency
+    await state.update_data(calculation_params=params)
+    
+    frequency_names = {
+        0: "не используется",
+        1: "каждый ряд",
+        2: "через ряд", 
+        3: "через 2 ряда",
+        4: "через 3 ряда",
+        5: "через 4 ряда"
+    }
+    
+    await callback.message.edit_text(f"✅ Сетка: {frequency_names[frequency]}")
+    await ask_about_price(callback.message, state)
+    await callback.answer()
+
+# Обработчики цены
+@dp.callback_query(F.data == "price_yes")
+async def handle_price_yes_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    material_type = data.get('material_type')
+    
+    price_units = {
+        'bricks': 'за штуку',
+        'ceramic_blocks': 'за штуку', 
+        'wall_blocks': 'за штуку',
+        'foam_blocks': 'за кубометр',
+        'gas_blocks': 'за кубометр'
+    }
+    
+    unit = price_units.get(material_type, 'за единицу')
+    
+    await callback.message.edit_text(f"""
+💰 <b>Цена материала</b>
+
+Введите цену {unit} в рублях:
+
+Введите цену:
+""", parse_mode="HTML")
+    await state.set_state(CalculationState.entering_price)
+    await callback.answer()
+
+@dp.callback_query(F.data == "price_no")
+async def handle_price_no_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    params = data.get('calculation_params', {})
+    params['price'] = 0
+    await state.update_data(calculation_params=params)
+    
+    await callback.message.edit_text("✅ Стоимость не рассчитывается")
+    await show_calculation_summary(callback.message, state)
+    await callback.answer()
+
+@dp.message(CalculationState.entering_price)
+async def handle_price_input_message(message: Message, state: FSMContext):
+    try:
+        price = float(message.text.strip())
+        if price < 0:
+            await message.answer("❌ Цена не может быть отрицательной. Введите цену:")
+            return
+            
+        data = await state.get_data()
+        params = data.get('calculation_params', {})
+        material_type = data.get('material_type')
+        
+        # Сохраняем цену в правильном поле
+        if material_type in ['foam_blocks', 'gas_blocks']:
+            params['price_per_cube'] = price
+        else:
+            params['price'] = price
+            
+        await state.update_data(calculation_params=params)
+        
+        await message.answer(f"✅ Цена установлена: {price} руб.")
+        await show_calculation_summary(message, state)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для цены:")
+
+# Обработчики подтверждения расчета
+@dp.callback_query(F.data == "confirm_calculation")
+async def handle_confirm_calculation_callback(callback: CallbackQuery, state: FSMContext):
+    try:
+        data = await state.get_data()
+        material_type = data.get('material_type')
+        params = data.get('calculation_params', {})
+        
+        if not material_type or not params:
+            await callback.message.edit_text("❌ Данные для расчета не найдены. Пожалуйста, начните расчет заново.")
+            await state.clear()
+            await callback.answer()
+            return
+        
+        # Выбираем функцию расчета
+        calculation_functions = {
+            'bricks': calculate_bricks_advanced,
+            'wall_blocks': calculate_wall_blocks_advanced,
+            'foam_blocks': calculate_foam_blocks_advanced,
+            'gas_blocks': calculate_gas_blocks_advanced,
+            'ceramic_blocks': calculate_ceramic_blocks_advanced
+        }
+        
+        calc_func = calculation_functions.get(material_type)
+        if not calc_func:
+            await callback.message.edit_text("❌ Неизвестный тип материала")
+            await state.clear()
+            await callback.answer()
+            return
+        
+        result = calc_func(params)
+        
+        if "error" in result:
+            result_text = f"❌ Ошибка расчета: {result['error']}"
+        else:
+            # Выбираем форматирование по типу материала
+            format_functions = {
+                'bricks': format_bricks_result,
+                'wall_blocks': format_wall_blocks_result,
+                'foam_blocks': format_foam_blocks_result,
+                'gas_blocks': format_gas_blocks_result,
+                'ceramic_blocks': format_ceramic_blocks_result
+            }
+            
+            format_func = format_functions.get(material_type, format_general_result)
+            result_text = format_func(result)
+            
+            log_audit(callback.from_user.id, callback.from_user.username, 
+                     f"advanced_calculation_{material_type}", 
+                     f"Материал: {result.get('material_type', 'unknown')}, Количество: {result.get('bricks_needed', result.get('blocks_needed', 0))}")
+        
+        await callback.message.edit_text(result_text, parse_mode="HTML", reply_markup=get_main_keyboard(callback.from_user.id))
+        
+    except Exception as e:
+        error_text = f"❌ Произошла ошибка при расчете: {str(e)}"
+        await callback.message.edit_text(error_text, reply_markup=get_main_keyboard(callback.from_user.id))
+        logger.error(f"Error in handle_confirm_calculation: {e}")
+    
+    finally:
+        await state.clear()
+        await callback.answer()
+
+@dp.callback_query(F.data == "edit_parameters")
+async def handle_edit_parameters_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("🔄 Какой параметр хотите изменить?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📏 Размеры материала", callback_data="edit_dimensions")],
+        [InlineKeyboardButton(text="🏠 Параметры строения", callback_data="edit_building")],
+        [InlineKeyboardButton(text="🔺 Фронтоны", callback_data="edit_gables")],
+        [InlineKeyboardButton(text="🚪🪟 Проемы", callback_data="edit_openings")],
+        [InlineKeyboardButton(text="🕸️ Кладочная сетка", callback_data="edit_mesh")],
+        [InlineKeyboardButton(text="💰 Цена", callback_data="edit_price")],
+        [InlineKeyboardButton(text="◀️ Назад к сводке", callback_data="back_to_summary")]
+    ]))
+    await callback.answer()
+
+@dp.callback_query(F.data == "restart_calculation")
+async def handle_restart_calculation_callback(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("🔄 Расчет сброшен. Выберите материал заново:", reply_markup=get_detailed_calculation_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_calc")
+async def back_to_calculation_callback(callback: CallbackQuery):
+    await show_calculation_options(callback)
+    await callback.answer()
+
+# Обработчики админ-панели
+@dp.callback_query(F.data == "products_panel")
+async def show_products_panel_callback(callback: CallbackQuery):
+    if is_staff(callback.from_user.id):
+        products_text = """
+🛒 ПАНЕЛЬ УПРАВЛЕНИЯ ТОВАРАМИ
+
+Управление ассортиментом магазина:
+
+• ➕ Добавить новый товар
+• ✏️ Редактировать существующий товар  
+• 🗑️ Удалить товар из базы
+
+Выберите действие:
+"""
+        await callback.message.edit_text(products_text, reply_markup=get_products_panel_keyboard())
+        log_audit(callback.from_user.id, callback.from_user.username, "open_products_panel", "Открыта панель управления товарами")
+    else:
+        await callback.answer("🚫 У вас нет прав доступа")
+
+@dp.callback_query(F.data == "admin_panel")
+async def show_admin_panel_callback(callback: CallbackQuery):
+    if is_admin(callback.from_user.id):
+        admin_text = """
+👑 АДМИН-ПАНЕЛЬ
+
+Управление системой:
+
+• 👥 Управление сотрудниками - добавление/удаление
+• 📊 Подробная статистика - детальная статистика системы
+• 📝 Аудит действий - просмотр логов действий
+
+Выберите действие:
+"""
+        await callback.message.edit_text(admin_text, reply_markup=get_admin_panel_keyboard())
+        log_audit(callback.from_user.id, callback.from_user.username, "open_admin_panel", "Открыта админ-панель")
+    else:
+        await callback.answer("🚫 У вас нет прав администратора")
+
+@dp.callback_query(F.data == "manage_staff")
+async def manage_staff_callback(callback: CallbackQuery):
+    if is_admin(callback.from_user.id):
+        staff_text = """
+👥 УПРАВЛЕНИЕ СОТРУДНИКАМИ
+
+• ➕ Добавить сотрудника - по ID пользователя
+• 👥 Список сотрудников - просмотр всех сотрудников
+• 🗑️ Удалить сотрудника - удаление из системы
+
+Выберите действие:
+"""
+        await callback.message.edit_text(staff_text, reply_markup=get_staff_management_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "add_staff")
+async def start_adding_staff_callback(callback: CallbackQuery, state: FSMContext):
+    if is_admin(callback.from_user.id):
+        instruction_text = """
+➕ ДОБАВЛЕНИЕ СОТРУДНИКА
+
+Введите ID пользователя, которого хотите добавить как сотрудника.
+
+ID можно получить:
+• Переслав сообщение от пользователя боту @userinfobot
+• Или используя команду /add_staff <ID> в чате
+
+Введите ID пользователя:
+"""
+        await callback.message.edit_text(instruction_text)
+        await state.set_state(AdminState.adding_staff)
+    await callback.answer()
+
+@dp.message(AdminState.adding_staff)
+async def handle_add_staff_message(message: Message, state: FSMContext):
+    try:
+        user_id = int(message.text.strip())
+        if add_staff(user_id, message.from_user.username, None, message.from_user.id):
+            await message.answer("✅ Сотрудник успешно добавлен!", reply_markup=get_admin_panel_keyboard())
+            log_audit(message.from_user.id, message.from_user.username, "add_staff", f"Добавлен сотрудник ID: {user_id}")
+        else:
+            await message.answer("❌ Ошибка: сотрудник уже существует или неверный ID")
+    except ValueError:
+        await message.answer("❌ Введите корректный ID (число)")
+    await state.clear()
+
+@dp.callback_query(F.data == "list_staff")
+async def list_staff_callback(callback: CallbackQuery):
+    if is_admin(callback.from_user.id):
+        await callback.message.edit_text("👥 СПИСОК СОТРУДНИКОВ:", reply_markup=get_staff_list_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("staff_page_"))
+async def handle_staff_pagination_callback(callback: CallbackQuery):
+    if is_admin(callback.from_user.id):
+        page = int(callback.data.split("_")[2])
+        await callback.message.edit_text("👥 СПИСОК СОТРУДНИКОВ:", reply_markup=get_staff_list_keyboard(page))
+    await callback.answer()
+
+@dp.callback_query(F.data == "remove_staff")
+async def show_remove_staff_callback(callback: CallbackQuery):
+    if is_admin(callback.from_user.id):
+        staff_list = get_all_staff()
+        if staff_list:
+            await callback.message.edit_text("🗑️ ВЫБЕРИТЕ СОТРУДНИКА ДЛА УДАЛЕНИЯ:", reply_markup=get_remove_staff_keyboard())
+        else:
+            await callback.message.edit_text("📭 Нет сотрудников для удаления", reply_markup=get_staff_management_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("remove_staff_page_"))
+async def handle_remove_staff_pagination_callback(callback: CallbackQuery):
+    if is_admin(callback.from_user.id):
+        page = int(callback.data.split("_")[3])
+        await callback.message.edit_text("🗑️ ВЫБЕРИТЕ СОТРУДНИКА ДЛЯ УДАЛЕНИЯ:", reply_markup=get_remove_staff_keyboard(page))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("remove_staff_"))
+async def handle_remove_staff_callback(callback: CallbackQuery):
+    if is_admin(callback.from_user.id):
+        user_id = int(callback.data.split("_")[2])
+        remove_staff(user_id)
+        await callback.message.edit_text("✅ Сотрудник успешно удален!", reply_markup=get_staff_management_keyboard())
+        log_audit(callback.from_user.id, callback.from_user.username, "remove_staff", f"Удален сотрудник ID: {user_id}")
+    await callback.answer()
+
+@dp.callback_query(F.data == "detailed_stats")
+async def show_detailed_stats_callback(callback: CallbackQuery):
+    if is_admin(callback.from_user.id):
+        stats = get_detailed_stats()
+        
+        stats_text = "📊 ПОДРОБНАЯ СТАТИСТИКА СИСТЕМЫ\n\n"
+        stats_text += f"📦 Всего товаров: {stats['total_products']}\n"
+        stats_text += f"👥 Всего сотрудников: {stats['total_staff']}\n"
+        stats_text += f"📝 Всего действий в системе: {stats['total_actions']}\n\n"
+        
+        stats_text += "📂 СТАТИСТИКА ПО КАТЕГОРИЯМ:\n"
+        for category in stats['category_stats']:
+            stats_text += f"• {category[0]}: {category[1]} товаров, {category[2]} шт., {category[3]:.2f} руб.\n"
+        
+        stats_text += "\n📈 САМЫЕ АКТИВНЫЕ ДЕЙСТВИЯ:\n"
+        for action in stats['activity_stats']:
+            stats_text += f"• {action[0]}: {action[1]} раз\n"
+        
+        stats_text += "\n⏰ ПОСЛЕДНИЕ ДЕЙСТВИЯ:\n"
+        for action in stats['recent_actions']:
+            stats_text += f"• {action[3]} - {action[5]}\n"
+        
+        await callback.message.edit_text(stats_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="detailed_stats")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")]
+        ]))
+        log_audit(callback.from_user.id, callback.from_user.username, "view_stats", "Просмотр подробной статистики")
+    await callback.answer()
+
+@dp.callback_query(F.data == "audit_log")
+async def show_audit_log_callback(callback: CallbackQuery):
+    if is_admin(callback.from_user.id):
+        await show_audit_log_page(callback, 1)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("audit_page_"))
+async def handle_audit_pagination_callback(callback: CallbackQuery):
+    if is_admin(callback.from_user.id):
+        page = int(callback.data.split("_")[2])
+        await show_audit_log_page(callback, page)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_add_product")
+async def start_adding_product_callback(callback: CallbackQuery, state: FSMContext):
+    if is_staff(callback.from_user.id):
+        await state.set_state(AdminState.adding_product_name)
+        await callback.message.edit_text("➕ ДОБАВЛЕНИЕ ТОВАРА\n\n📝 Введите название товара:")
+        log_audit(callback.from_user.id, callback.from_user.username, "start_add_product", "Начато добавление товара")
+    await callback.answer()
+
+@dp.message(AdminState.adding_product_name)
+async def handle_product_name_message(message: Message, state: FSMContext):
+    await state.update_data(product_name=message.text)
+    await state.set_state(AdminState.adding_product_price)
+    await message.answer("💰 Введите цену товара (в рублях):")
+    log_audit(message.from_user.id, message.from_user.username, "add_product_name", f"Название: {message.text}")
+
+@dp.message(AdminState.adding_product_price)
+async def handle_product_price_message(message: Message, state: FSMContext):
+    try:
+        price = float(message.text)
+        if price <= 0:
+            raise ValueError("Цена должна быть положительной")
+        
+        await state.update_data(product_price=price)
+        await state.set_state(AdminState.adding_product_quantity)
+        await message.answer("📦 Введите количество товара:")
+        log_audit(message.from_user.id, message.from_user.username, "add_product_price", f"Цена: {price} руб.")
+    except ValueError:
+        await message.answer("❌ Введите корректную цену (число):")
+
+@dp.message(AdminState.adding_product_quantity)
+async def handle_product_quantity_message(message: Message, state: FSMContext):
+    try:
+        quantity = int(message.text)
+        if quantity < 0:
+            raise ValueError("Количество не может быть отрицательным")
+        
+        await state.update_data(product_quantity=quantity)
+        await state.set_state(AdminState.adding_product_category)
+        await message.answer("📂 Выберите категорию товара:", reply_markup=get_category_keyboard())
+        log_audit(message.from_user.id, message.from_user.username, "add_product_quantity", f"Количество: {quantity}")
+    except ValueError:
+        await message.answer("❌ Введите целое число для количества:")
+
+@dp.callback_query(F.data.startswith("select_category_"))
+async def handle_product_category_callback(callback: CallbackQuery, state: FSMContext):
+    if is_staff(callback.from_user.id):
+        category = callback.data.split("_")[2]
+        await state.update_data(product_category=category)
+        await state.set_state(AdminState.adding_product_unit)
+        await callback.message.edit_text("📏 Введите единицу измерения (шт., м³, кг, мешок и т.д.):")
+        log_audit(callback.from_user.id, callback.from_user.username, "add_product_category", f"Категория: {category}")
+    await callback.answer()
+
+@dp.callback_query(F.data == "new_category")
+async def handle_new_category_callback(callback: CallbackQuery, state: FSMContext):
+    if is_staff(callback.from_user.id):
+        await callback.message.edit_text("📂 Введите название новой категории:")
+        # Сохраним состояние, чтобы после ввода категории перейти к единице измерения
+        await state.set_state(AdminState.adding_product_category)
+    await callback.answer()
+
+@dp.message(AdminState.adding_product_category)
+async def handle_new_category_input_message(message: Message, state: FSMContext):
+    await state.update_data(product_category=message.text.strip().lower())
+    await state.set_state(AdminState.adding_product_unit)
+    await message.answer("📏 Введите единицу измерения (шт., м³, кг, мешок и т.д.):")
+    log_audit(message.from_user.id, message.from_user.username, "add_new_category", f"Новая категория: {message.text}")
+
+@dp.message(AdminState.adding_product_unit)
+async def handle_product_unit_message(message: Message, state: FSMContext):
+    await state.update_data(product_unit=message.text)
+    await state.set_state(AdminState.adding_product_description)
+    await message.answer("📝 Введите описание товара (или отправьте '-' если описание не нужно):")
+    log_audit(message.from_user.id, message.from_user.username, "add_product_unit", f"Единица: {message.text}")
+
+@dp.message(AdminState.adding_product_description)
+async def handle_product_description_message(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    description = message.text if message.text != "-" else ""
+    
+    # Сохраняем товар
+    add_product(
+        user_data['product_name'],
+        user_data['product_price'],
+        user_data['product_quantity'],
+        user_data['product_category'],
+        user_data['product_unit'],
+        description
+    )
+    
+    await message.answer("✅ Товар успешно добавлен!", reply_markup=get_products_panel_keyboard())
+    log_audit(message.from_user.id, message.from_user.username, "add_product_complete", 
+             f"Товар: {user_data['product_name']}, Цена: {user_data['product_price']}, Категория: {user_data['product_category']}")
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "cancel_add_product")
+async def cancel_add_product_callback(callback: CallbackQuery, state: FSMContext):
+    if is_staff(callback.from_user.id):
+        await state.clear()
+        await callback.message.edit_text("❌ Добавление товара отменено", reply_markup=get_products_panel_keyboard())
+        log_audit(callback.from_user.id, callback.from_user.username, "cancel_add_product", "Отмена добавления товара")
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_edit_product")
+async def start_editing_product_callback(callback: CallbackQuery):
+    if is_staff(callback.from_user.id):
+        await callback.message.edit_text("✏️ Выберите товар для редактирования:", reply_markup=get_admin_products_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("admin_product_"))
+async def handle_delete_product_selection_callback(callback: CallbackQuery, state: FSMContext):
+    if is_staff(callback.from_user.id):
+        product_id = int(callback.data.split("_")[2])
+        product = get_product_by_id(product_id)
+        
+        if product:
+            await state.update_data(deleting_product_id=product_id)
+            
+            confirm_text = f"""
+🗑️ <b>ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ</b>
+
+Вы уверены, что хотите удалить товар:
+"{product[1]}"
+
+💰 Цена: {product[2]} руб.
+📦 Количество: {product[3]} {product[5]}
+📂 Категория: {product[4]}
+"""
+
+            # Клавиатура с кнопками Да/Нет
+            confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_delete_{product_id}")],
+                [InlineKeyboardButton(text="❌ Нет, оставить", callback_data="cancel_delete")]
+            ])
+            
+            await callback.message.edit_text(confirm_text, parse_mode="HTML", reply_markup=confirm_keyboard)
+            log_audit(callback.from_user.id, callback.from_user.username, "confirm_delete", f"Товар ID: {product_id}")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("confirm_delete_"))
+async def handle_confirm_delete_callback(callback: CallbackQuery):
+    if is_staff(callback.from_user.id):
+        product_id = int(callback.data.split("_")[2])
+        product = get_product_by_id(product_id)
+        
+        if product:
+            delete_product(product_id)
+            await callback.message.edit_text(
+                f"✅ Товар '{product[1]}' успешно удален!", 
+                reply_markup=get_products_panel_keyboard()
+            )
+            log_audit(callback.from_user.id, callback.from_user.username, "delete_product", 
+                     f"Товар ID: {product_id}, Название: {product[1]}")
+    await callback.answer()
+
+@dp.callback_query(F.data == "cancel_delete")
+async def handle_cancel_delete_callback(callback: CallbackQuery):
+    if is_staff(callback.from_user.id):
+        await callback.message.edit_text(
+            "❌ Удаление отменено", 
+            reply_markup=get_products_panel_keyboard()
+        )
+        log_audit(callback.from_user.id, callback.from_user.username, "cancel_delete", "Отмена удаления товара")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_product_"))
+async def handle_product_selection_callback(callback: CallbackQuery):
+    if is_staff(callback.from_user.id):
+        product_id = int(callback.data.split("_")[2])
+        product = get_product_by_id(product_id)
+        
+        if product:
+            product_info = f"""
+✏️ <b>РЕДАКТИРОВАНИЕ ТОВАРА</b>
+
+🔹 Название: {product[1]}
+💰 Цена: {product[2]} руб.
+📦 Количество: {product[3]} {product[5]}
+📂 Категория: {product[4]}
+📏 Единица: {product[5]}
+📝 Описание: {product[6] or 'Отсутствует'}
+
+Выберите что хотите <b>отредактировать</b>:
+"""
+            await callback.message.edit_text(product_info, parse_mode="HTML", reply_markup=get_edit_product_keyboard(product_id))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("edit_name_"))
+async def start_editing_name_callback(callback: CallbackQuery, state: FSMContext):
+    if is_staff(callback.from_user.id):
+        product_id = int(callback.data.split("_")[2])
+        product = get_product_by_id(product_id)
+        
+        if product:
+            await state.update_data(editing_product_id=product_id)
+            await state.set_state(AdminState.editing_product_name)
+            await callback.message.edit_text(f"✏️ Введите новое название для товара '{product[1]}':")
+            log_audit(callback.from_user.id, callback.from_user.username, "start_edit_name", f"Товар ID: {product_id}")
+    await callback.answer()
+
+@dp.message(AdminState.editing_product_name)
+async def handle_edit_name_message(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    product_id = user_data.get('editing_product_id')
+    
+    try:
+        new_name = message.text.strip()
+        if not new_name:
+            raise ValueError("Название не может быть пустым")
+        
+        product = get_product_by_id(product_id)
+        if product:
+            update_product_name(product_id, new_name)
+            await message.answer(f"✅ Название товара успешно изменено на '{new_name}'!", reply_markup=get_products_panel_keyboard())
+            log_audit(message.from_user.id, message.from_user.username, "edit_name", 
+                     f"Товар ID: {product_id}, Новое название: {new_name}")
+        
+    except Exception as e:
+        await message.answer("❌ Ошибка при обновлении названия.")
+    
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("edit_price_"))
+async def start_editing_price_callback(callback: CallbackQuery, state: FSMContext):
+    if is_staff(callback.from_user.id):
+        product_id = int(callback.data.split("_")[2])
+        product = get_product_by_id(product_id)
+        
+        if product:
+            await state.update_data(editing_product_id=product_id)
+            await state.set_state(AdminState.editing_product_price)
+            await callback.message.edit_text(f"💰 Введите новую цену для товара '{product[1]}' (текущая: {product[2]} руб.):")
+            log_audit(callback.from_user.id, callback.from_user.username, "start_edit_price", f"Товар ID: {product_id}")
+    await callback.answer()
+
+@dp.message(AdminState.editing_product_price)
+async def handle_edit_price_message(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    product_id = user_data.get('editing_product_id')
+    
+    try:
+        new_price = float(message.text.strip())
+        if new_price <= 0:
+            raise ValueError("Цена должна быть положительной")
+        
+        product = get_product_by_id(product_id)
+        if product:
+            update_product_price(product_id, new_price)
+            await message.answer(f"✅ Цена товара успешно изменена на {new_price} руб.!", reply_markup=get_products_panel_keyboard())
+            log_audit(message.from_user.id, message.from_user.username, "edit_price", 
+                     f"Товар ID: {product_id}, Новая цена: {new_price} руб.")
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число для цены.")
+    except Exception as e:
+        await message.answer("❌ Ошибка при обновлении цены.")
+    
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("edit_quantity_"))
+async def start_editing_quantity_callback(callback: CallbackQuery, state: FSMContext):
+    if is_staff(callback.from_user.id):
+        product_id = int(callback.data.split("_")[2])
+        product = get_product_by_id(product_id)
+        
+        if product:
+            await state.update_data(editing_product_id=product_id)
+            await state.set_state(AdminState.editing_product_quantity)
+            await callback.message.edit_text(f"📦 Введите новое количество для товара '{product[1]}' (текущее: {product[3]} {product[5]}):")
+            log_audit(callback.from_user.id, callback.from_user.username, "start_edit_quantity", f"Товар ID: {product_id}")
+    await callback.answer()
+
+@dp.message(AdminState.editing_product_quantity)
+async def handle_edit_quantity_message(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    product_id = user_data.get('editing_product_id')
+    
+    try:
+        new_quantity = int(message.text.strip())
+        if new_quantity < 0:
+            raise ValueError("Количество не может быть отрицательным")
+        
+        product = get_product_by_id(product_id)
+        if product:
+            update_product_quantity(product_id, new_quantity)
+            await message.answer(f"✅ Количество товара успешно изменено на {new_quantity} {product[5]}!", reply_markup=get_products_panel_keyboard())
+            log_audit(message.from_user.id, message.from_user.username, "edit_quantity", 
+                     f"Товар ID: {product_id}, Новое количество: {new_quantity}")
+        
+    except ValueError:
+        await message.answer("❌ Введите целое число для количества.")
+    except Exception as e:
+        await message.answer("❌ Ошибка при обновлении количества.")
+    
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("edit_category_"))
+async def start_editing_category_callback(callback: CallbackQuery, state: FSMContext):
+    if is_staff(callback.from_user.id):
+        product_id = int(callback.data.split("_")[2])
+        product = get_product_by_id(product_id)
+        
+        if product:
+            await state.update_data(editing_product_id=product_id)
+            await state.set_state(AdminState.editing_product_category)
+            categories = get_product_categories()
+            categories_text = "\n".join([f"• {cat}" for cat in categories])
+            await callback.message.edit_text(
+                f"📂 Введите новую категорию для товара '{product[1]}' (текущая: {product[4]})\n\n"
+                f"Доступные категории:\n{categories_text}\n\n"
+                f"Или введите новую категорию:"
+            )
+            log_audit(callback.from_user.id, callback.from_user.username, "start_edit_category", f"Товар ID: {product_id}")
+    await callback.answer()
+
+@dp.message(AdminState.editing_product_category)
+async def handle_edit_category_message(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    product_id = user_data.get('editing_product_id')
+    
+    try:
+        new_category = message.text.strip().lower()
+        if not new_category:
+            raise ValueError("Категория не может быть пустой")
+        
+        product = get_product_by_id(product_id)
+        if product:
+            update_product_category(product_id, new_category)
+            await message.answer(f"✅ Категория товара успешно изменена на '{new_category}'!", reply_markup=get_products_panel_keyboard())
+            log_audit(message.from_user.id, message.from_user.username, "edit_category", 
+                     f"Товар ID: {product_id}, Новая категория: {new_category}")
+        
+    except Exception as e:
+        await message.answer("❌ Ошибка при обновлении категории.")
+    
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("edit_unit_"))
+async def start_editing_unit_callback(callback: CallbackQuery, state: FSMContext):
+    if is_staff(callback.from_user.id):
+        product_id = int(callback.data.split("_")[2])
+        product = get_product_by_id(product_id)
+        
+        if product:
+            await state.update_data(editing_product_id=product_id)
+            await state.set_state(AdminState.editing_product_unit)
+            await callback.message.edit_text(f"📏 Введите новую единицу измерения для товара '{product[1]}' (текущая: {product[5]}):")
+            
+
+@dp.message(AdminState.editing_product_unit)
+async def handle_edit_unit_message(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    product_id = user_data.get('editing_product_id')
+    
+    try:
+        new_unit = message.text.strip()
+        if not new_unit:
+            raise ValueError("Единица измерения не может быть пустой")
+        
+        product = get_product_by_id(product_id)
+        if product:
+            update_product_unit(product_id, new_unit)
+            await message.answer(f"✅ Единица измерения успешно изменена на '{new_unit}'!", reply_markup=get_products_panel_keyboard())
+            log_audit(message.from_user.id, message.from_user.username, "edit_unit", 
+                     f"Товар ID: {product_id}, Новая единица: {new_unit}")
+        
+    except Exception as e:
+        await message.answer("❌ Ошибка при обновлении единицы измерения.")
+    
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("edit_description_"))
+async def start_editing_description_callback(callback: CallbackQuery, state: FSMContext):
+    if is_staff(callback.from_user.id):
+        product_id = int(callback.data.split("_")[2])
+        product = get_product_by_id(product_id)
+        
+        if product:
+            await state.update_data(editing_product_id=product_id)
+            await state.set_state(AdminState.editing_product_description)
+            current_desc = product[6] or "Отсутствует"
+            await callback.message.edit_text(f"📝 Введите новое описание для товара '{product[1]}' (текущее: {current_desc}):")
+            log_audit(callback.from_user.id, callback.from_user.username, "start_edit_description", f"Товар ID: {product_id}")
+    await callback.answer()
+
+@dp.message(AdminState.editing_product_description)
+async def handle_edit_description_message(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    product_id = user_data.get('editing_product_id')
+    
+    try:
+        new_description = message.text.strip()
+        product = get_product_by_id(product_id)
+        if product:
+            update_product_description(product_id, new_description)
+            await message.answer("✅ Описание товара успешно обновлено!", reply_markup=get_products_panel_keyboard())
+            log_audit(message.from_user.id, message.from_user.username, "edit_description", 
+                     f"Товар ID: {product_id}, Новое описание: {new_description[:50]}...")
+        
+    except Exception as e:
+        await message.answer("❌ Ошибка при обновлении описания.")
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "admin_delete_product")
+async def start_deleting_product_callback(callback: CallbackQuery):
+    if is_staff(callback.from_user.id):
+        await callback.message.edit_text("🗑️ Выберите товар для удаления:", reply_markup=get_admin_products_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("products_page_"))
+async def handle_products_pagination_callback(callback: CallbackQuery):
+    if is_staff(callback.from_user.id):
+        page = int(callback.data.split("_")[2])
+        await callback.message.edit_text("✏️ Выберите товар для редактирования:", reply_markup=get_admin_products_keyboard(page))
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_edit_product_1")
+async def handle_back_to_products_list_callback(callback: CallbackQuery):
+    if is_staff(callback.from_user.id):
+        await callback.message.edit_text("✏️ Выберите товар для редактирования:", reply_markup=get_admin_products_keyboard(1))
+        log_audit(callback.from_user.id, callback.from_user.username, "back_to_products_list", "Возврат к списку товаров из редактора")
+    await callback.answer()
+
+# Запуск бота
+async def main():
+    init_db()  # Инициализация базы данных
+    print("Бот запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
